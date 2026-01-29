@@ -95,9 +95,7 @@ async fn run_source(config_path: std::path::PathBuf, args: cli::SourceArgs) -> a
 
     // Spawn the main run loop
     let source_run = source.clone();
-    let run_handle = tokio::spawn(async move {
-        source_run.run().await
-    });
+    let run_handle = tokio::spawn(async move { source_run.run().await });
 
     // Wait for shutdown signal
     wait_for_shutdown_signal().await;
@@ -158,9 +156,7 @@ async fn run_dest(config_path: std::path::PathBuf, args: cli::DestArgs) -> anyho
 
     // Spawn the main run loop
     let dest_run = dest.clone();
-    let run_handle = tokio::spawn(async move {
-        dest_run.run().await
-    });
+    let run_handle = tokio::spawn(async move { dest_run.run().await });
 
     // Wait for shutdown signal
     wait_for_shutdown_signal().await;

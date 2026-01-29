@@ -411,10 +411,9 @@ impl HandshakeContext {
             .map_err(|e| HandshakeError::KeyExchangeError(e.to_string()))?;
 
         // Use the keypair we generated in create_client_hello to decapsulate
-        let client_keypair = self
-            .client_keypair
-            .as_ref()
-            .ok_or_else(|| HandshakeError::KeyExchangeError("Client keypair not found".to_string()))?;
+        let client_keypair = self.client_keypair.as_ref().ok_or_else(|| {
+            HandshakeError::KeyExchangeError("Client keypair not found".to_string())
+        })?;
         let shared_from_server = self
             .key_manager
             .decapsulate_hybrid(client_keypair, &server_ct)
@@ -593,10 +592,9 @@ impl HandshakeContext {
             .map_err(|e| HandshakeError::KeyExchangeError(e.to_string()))?;
 
         // Use the keypair we generated in process_client_hello to decapsulate
-        let server_keypair = self
-            .server_keypair
-            .as_ref()
-            .ok_or_else(|| HandshakeError::KeyExchangeError("Server keypair not found".to_string()))?;
+        let server_keypair = self.server_keypair.as_ref().ok_or_else(|| {
+            HandshakeError::KeyExchangeError("Server keypair not found".to_string())
+        })?;
         let shared_from_client = self
             .key_manager
             .decapsulate_hybrid(server_keypair, &client_ct)
@@ -700,9 +698,15 @@ impl HandshakeContext {
         // For client role: handshake_timestamp_ms is client_ts, peer_timestamp_ms is server_ts
         // For server role: handshake_timestamp_ms is server_ts, peer_timestamp_ms is client_ts
         let (client_ts, server_ts) = if self.is_client_role {
-            (self.handshake_timestamp_ms, self.peer_timestamp_ms.unwrap_or(0))
+            (
+                self.handshake_timestamp_ms,
+                self.peer_timestamp_ms.unwrap_or(0),
+            )
         } else {
-            (self.peer_timestamp_ms.unwrap_or(0), self.handshake_timestamp_ms)
+            (
+                self.peer_timestamp_ms.unwrap_or(0),
+                self.handshake_timestamp_ms,
+            )
         };
 
         hasher.update(client_ts.to_le_bytes());

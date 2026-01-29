@@ -85,7 +85,10 @@ pub struct SourceContainer {
 }
 
 impl SourceContainer {
-    pub async fn new(config: SourceConfig, crypto_config: CryptoConfig) -> Result<Self, SourceError> {
+    pub async fn new(
+        config: SourceConfig,
+        crypto_config: CryptoConfig,
+    ) -> Result<Self, SourceError> {
         let key_manager = Arc::new(KeyManager::new(3600, 300)); // 1 hour rotation, 5 min window
         let connection_manager = Arc::new(ConnectionManager::new(
             config.max_connections,

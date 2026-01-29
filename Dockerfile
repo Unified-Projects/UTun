@@ -17,6 +17,7 @@ WORKDIR /app/utun
 
 # Copy dependency files
 COPY Cargo.toml Cargo.lock ./
+COPY benches/ ./benches/
 
 # Build dependencies only (cached)
 RUN cargo build --release && rm src/*.rs && rm target/release/deps/utun*

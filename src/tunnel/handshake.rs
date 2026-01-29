@@ -206,11 +206,7 @@ fn validate_timestamp(peer_timestamp_ms: u64) -> Result<(), HandshakeError> {
 
     // Check if timestamp is too old
     if peer_ms < now_ms - (MAX_HANDSHAKE_AGE_SECONDS * 1000) {
-        tracing::warn!(
-            "Handshake timestamp too old: {} vs now {}",
-            peer_ms,
-            now_ms
-        );
+        tracing::warn!("Handshake timestamp too old: {} vs now {}", peer_ms, now_ms);
         return Err(HandshakeError::ReplayDetected);
     }
 
@@ -297,7 +293,7 @@ impl HandshakeContext {
     // Client-side: Create ClientHello
     pub fn create_client_hello(&mut self) -> Result<ClientHello, HandshakeError> {
         // Generate random
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill_bytes(&mut self.client_random);
 
         // Record handshake timestamp for replay protection
@@ -492,7 +488,7 @@ impl HandshakeContext {
         self.client_public_key = Some(client_public_key.clone());
 
         // Generate server random
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill_bytes(&mut self.server_random);
 
         // Generate ephemeral keypair
@@ -546,11 +542,11 @@ impl HandshakeContext {
 
         // Verify hostname if configured (for mutual TLS scenarios)
         if let Some(ref expected_hostname) = self.expected_peer_hostname {
-            verify_certificate_hostname(&finished.certificate, expected_hostname).map_err(|_| {
-                HandshakeError::HostnameVerificationFailed {
+            verify_certificate_hostname(&finished.certificate, expected_hostname).map_err(
+                |_| HandshakeError::HostnameVerificationFailed {
                     expected: expected_hostname.clone(),
-                }
-            })?;
+                },
+            )?;
         }
 
         // Deserialize client ciphertext from bytes
@@ -638,9 +634,9 @@ impl HandshakeContext {
         hasher.update(if is_client { b"client" } else { b"server" });
 
         // Include timestamps in verify_data for replay protection
-        hasher.update(&self.handshake_timestamp_ms.to_le_bytes());
+        hasher.update(self.handshake_timestamp_ms.to_le_bytes());
         if let Some(peer_ts) = self.peer_timestamp_ms {
-            hasher.update(&peer_ts.to_le_bytes());
+            hasher.update(peer_ts.to_le_bytes());
         }
 
         if let Some(ref ss_client) = self.shared_secret_client {

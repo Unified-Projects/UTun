@@ -2,7 +2,7 @@ use chrono::Utc;
 use pem_rfc7468;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -50,13 +50,11 @@ fn check_windows_file_permissions(path: &Path) -> Result<(), AuthError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{BOOL, PSID};
-    use windows::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT,
-    };
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows::Win32::Security::{
-        GetAce, GetAclInformation, IsWellKnownSid, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        ACCESS_ALLOWED_ACE, AclSizeInformation, SECURITY_DESCRIPTOR, WinWorldSid,
-        WinBuiltinUsersSid,
+        AclSizeInformation, GetAce, GetAclInformation, IsWellKnownSid, WinBuiltinUsersSid,
+        WinWorldSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+        SECURITY_DESCRIPTOR,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
@@ -345,14 +343,8 @@ pub fn generate_server_certificate(
     let (_, _ca_x509) = X509Certificate::from_der(&ca_cert_der)
         .map_err(|e| AuthError::CertParseError(format!("Failed to parse CA cert DER: {}", e)))?;
 
-    // Build CA certificate params from parsed cert
-    let ca_cert_der_owned = CertificateDer::from(ca_cert_der);
-    let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der_owned)
-        .map_err(|e| AuthError::CertParseError(format!("Failed to build CA params: {}", e)))?;
-
-    let ca_cert = ca_params.self_signed(&ca_key_pair).map_err(|e| {
-        AuthError::GenerationFailed(format!("Failed to reconstruct CA cert: {}", e))
-    })?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key_pair)
+        .map_err(|e| AuthError::CertParseError(format!("Failed to parse CA cert PEM: {}", e)))?;
 
     // Create server key pair
     let server_key_pair = KeyPair::generate()
@@ -395,7 +387,7 @@ pub fn generate_server_certificate(
 
     // Sign certificate with CA (proper CA signing implemented)
     let cert = params
-        .signed_by(&server_key_pair, &ca_cert, &ca_key_pair)
+        .signed_by(&server_key_pair, &issuer)
         .map_err(|e| AuthError::GenerationFailed(format!("CA signing failed: {}", e)))?;
 
     // Serialize to PEM and DER
@@ -431,14 +423,8 @@ pub fn generate_client_certificate(
     let (_, _ca_x509) = X509Certificate::from_der(&ca_cert_der)
         .map_err(|e| AuthError::CertParseError(format!("Failed to parse CA cert DER: {}", e)))?;
 
-    // Build CA certificate params from parsed cert
-    let ca_cert_der_owned = CertificateDer::from(ca_cert_der);
-    let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der_owned)
-        .map_err(|e| AuthError::CertParseError(format!("Failed to build CA params: {}", e)))?;
-
-    let ca_cert = ca_params.self_signed(&ca_key_pair).map_err(|e| {
-        AuthError::GenerationFailed(format!("Failed to reconstruct CA cert: {}", e))
-    })?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key_pair)
+        .map_err(|e| AuthError::CertParseError(format!("Failed to parse CA cert PEM: {}", e)))?;
 
     // Create client key pair
     let client_key_pair = KeyPair::generate()
@@ -469,7 +455,7 @@ pub fn generate_client_certificate(
 
     // Sign certificate with CA (proper CA signing implemented)
     let cert = params
-        .signed_by(&client_key_pair, &ca_cert, &ca_key_pair)
+        .signed_by(&client_key_pair, &issuer)
         .map_err(|e| AuthError::GenerationFailed(format!("CA signing failed: {}", e)))?;
 
     // Serialize to PEM and DER
@@ -541,7 +527,7 @@ pub fn load_cert_bundle(cert_path: &Path, key_path: &Path) -> Result<CertBundle,
 
     // Sanity check: warn if system time seems unreasonable
     // (before year 2020 or after year 2100)
-    if now < 1577836800 || now > 4102444800 {
+    if !(1577836800..=4102444800).contains(&now) {
         tracing::warn!(
             "System clock may be incorrect (timestamp: {}). Certificate validation may be unreliable.",
             now
@@ -752,12 +738,10 @@ pub fn create_server_tls_config(
                 .with_client_cert_verifier(verifier)
                 .with_single_cert(
                     vec![CertificateDer::from(server_bundle.certificate_der)],
-                    PrivateKeyDer::try_from(
-                        server_bundle.private_key_der.expose_secret().to_vec(),
-                    )
-                    .map_err(|_| {
-                        AuthError::KeyLoadError("Invalid private key format".to_string())
-                    })?,
+                    PrivateKeyDer::try_from(server_bundle.private_key_der.expose_secret().to_vec())
+                        .map_err(|_| {
+                            AuthError::KeyLoadError("Invalid private key format".to_string())
+                        })?,
                 )
                 .map_err(|e| {
                     AuthError::GenerationFailed(format!("Server config creation failed: {}", e))

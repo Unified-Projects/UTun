@@ -6,6 +6,10 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "bincode"
+        update-types:
+          - "version-update:semver-major"
     groups:
       # Group all post-quantum crypto dependencies
       pq-crypto:

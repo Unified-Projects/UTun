@@ -40,7 +40,10 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
                 .with(tracing_subscriber::fmt::layer().json())
                 .init();
         }
-        "plain" | _ => {
+        "plain" => {
+            subscriber.with(tracing_subscriber::fmt::layer()).init();
+        }
+        _ => {
             subscriber.with(tracing_subscriber::fmt::layer()).init();
         }
     }
@@ -185,7 +188,7 @@ async fn start_metrics_server(
 ) {
     use warp::Filter;
 
-    let metrics = warp::path("metrics").map(|| {
+    let metrics = warp::path("metrics".to_string()).map(|| {
         use prometheus::{Encoder, TextEncoder};
         let encoder = TextEncoder::new();
         let metric_families = prometheus::gather();
@@ -210,22 +213,24 @@ async fn start_metrics_server(
 
     let health_monitor_filter = warp::any().map(move || health_monitor.clone());
 
-    let health = warp::path("health").and(health_monitor_filter).and_then(
-        |health_monitor: Option<std::sync::Arc<health::HealthMonitor>>| async move {
-            match health_monitor {
-                Some(monitor) => {
-                    let result = monitor.check_health().await;
-                    Ok::<_, warp::Rejection>(warp::reply::json(&result))
+    let health = warp::path("health".to_string())
+        .and(health_monitor_filter)
+        .and_then(
+            |health_monitor: Option<std::sync::Arc<health::HealthMonitor>>| async move {
+                match health_monitor {
+                    Some(monitor) => {
+                        let result = monitor.check_health().await;
+                        Ok::<_, warp::Rejection>(warp::reply::json(&result))
+                    }
+                    None => {
+                        // Fallback for when no health monitor is available
+                        Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({"status": "healthy"}),
+                        ))
+                    }
                 }
-                None => {
-                    // Fallback for when no health monitor is available
-                    Ok::<_, warp::Rejection>(warp::reply::json(
-                        &serde_json::json!({"status": "healthy"}),
-                    ))
-                }
-            }
-        },
-    );
+            },
+        );
 
     let routes = metrics.or(health);
 

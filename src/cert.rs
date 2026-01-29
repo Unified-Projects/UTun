@@ -21,11 +21,11 @@ pub enum CertCommand {
         #[arg(long, default_value = "3650")]
         validity_days: u32,
 
-        /// Output certificate to file (default: stdout)
+        /// Output certificate to file
         #[arg(long)]
         out_cert: Option<PathBuf>,
 
-        /// Output private key to file (default: stdout)
+        /// Output private key to file
         #[arg(long)]
         out_key: Option<PathBuf>,
     },
@@ -56,11 +56,11 @@ pub enum CertCommand {
         #[arg(long, default_value = "365")]
         validity_days: u32,
 
-        /// Output certificate to file (default: stdout)
+        /// Output certificate to file
         #[arg(long)]
         out_cert: Option<PathBuf>,
 
-        /// Output private key to file (default: stdout)
+        /// Output private key to file
         #[arg(long)]
         out_key: Option<PathBuf>,
     },
@@ -83,11 +83,11 @@ pub enum CertCommand {
         #[arg(long, default_value = "365")]
         validity_days: u32,
 
-        /// Output certificate to file (default: stdout)
+        /// Output certificate to file
         #[arg(long)]
         out_cert: Option<PathBuf>,
 
-        /// Output private key to file (default: stdout)
+        /// Output private key to file
         #[arg(long)]
         out_key: Option<PathBuf>,
     },
@@ -128,33 +128,31 @@ pub fn execute_cert_command(cmd: CertCommand) -> Result<()> {
             let bundle = generate_ca_certificate(&common_name, validity_days)?;
 
             // Write certificate
-            if let Some(cert_path) = out_cert {
-                fs::write(&cert_path, &bundle.certificate_pem)?;
-                eprintln!("CA certificate written to: {}", cert_path.display());
-            } else {
-                println!("{}", bundle.certificate_pem);
-            }
+            let cert_path = out_cert.ok_or_else(|| {
+                anyhow::anyhow!("--out-cert is required; refusing to print certificate to stdout")
+            })?;
+            fs::write(&cert_path, &bundle.certificate_pem)?;
+            eprintln!("CA certificate written to: {}", cert_path.display());
 
             // Write private key
-            if let Some(key_path) = out_key {
-                // Set restrictive permissions (600) on Unix systems
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
-                    let metadata = fs::metadata(&key_path)?;
-                    let mut permissions = metadata.permissions();
-                    permissions.set_mode(0o600);
-                    fs::set_permissions(&key_path, permissions)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
-                }
-                eprintln!("CA private key written to: {}", key_path.display());
-            } else {
-                println!("{}", bundle.private_key_pem.expose_secret());
+            let key_path = out_key.ok_or_else(|| {
+                anyhow::anyhow!("--out-key is required; refusing to print private key to stdout")
+            })?;
+            // Set restrictive permissions (600) on Unix systems
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
+                let metadata = fs::metadata(&key_path)?;
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                fs::set_permissions(&key_path, permissions)?;
             }
+            #[cfg(not(unix))]
+            {
+                fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
+            }
+            eprintln!("CA private key written to: {}", key_path.display());
 
             eprintln!("CA certificate generated successfully");
         }
@@ -184,33 +182,31 @@ pub fn execute_cert_command(cmd: CertCommand) -> Result<()> {
             )?;
 
             // Write certificate
-            if let Some(cert_path) = out_cert {
-                fs::write(&cert_path, &bundle.certificate_pem)?;
-                eprintln!("Server certificate written to: {}", cert_path.display());
-            } else {
-                println!("{}", bundle.certificate_pem);
-            }
+            let cert_path = out_cert.ok_or_else(|| {
+                anyhow::anyhow!("--out-cert is required; refusing to print certificate to stdout")
+            })?;
+            fs::write(&cert_path, &bundle.certificate_pem)?;
+            eprintln!("Server certificate written to: {}", cert_path.display());
 
             // Write private key
-            if let Some(key_path) = out_key {
-                // Set restrictive permissions (600) on Unix systems
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
-                    let metadata = fs::metadata(&key_path)?;
-                    let mut permissions = metadata.permissions();
-                    permissions.set_mode(0o600);
-                    fs::set_permissions(&key_path, permissions)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
-                }
-                eprintln!("Server private key written to: {}", key_path.display());
-            } else {
-                println!("{}", bundle.private_key_pem.expose_secret());
+            let key_path = out_key.ok_or_else(|| {
+                anyhow::anyhow!("--out-key is required; refusing to print private key to stdout")
+            })?;
+            // Set restrictive permissions (600) on Unix systems
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
+                let metadata = fs::metadata(&key_path)?;
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                fs::set_permissions(&key_path, permissions)?;
             }
+            #[cfg(not(unix))]
+            {
+                fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
+            }
+            eprintln!("Server private key written to: {}", key_path.display());
 
             eprintln!("Server certificate generated successfully");
         }
@@ -236,33 +232,31 @@ pub fn execute_cert_command(cmd: CertCommand) -> Result<()> {
             )?;
 
             // Write certificate
-            if let Some(cert_path) = out_cert {
-                fs::write(&cert_path, &bundle.certificate_pem)?;
-                eprintln!("Client certificate written to: {}", cert_path.display());
-            } else {
-                println!("{}", bundle.certificate_pem);
-            }
+            let cert_path = out_cert.ok_or_else(|| {
+                anyhow::anyhow!("--out-cert is required; refusing to print certificate to stdout")
+            })?;
+            fs::write(&cert_path, &bundle.certificate_pem)?;
+            eprintln!("Client certificate written to: {}", cert_path.display());
 
             // Write private key
-            if let Some(key_path) = out_key {
-                // Set restrictive permissions (600) on Unix systems
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
-                    let metadata = fs::metadata(&key_path)?;
-                    let mut permissions = metadata.permissions();
-                    permissions.set_mode(0o600);
-                    fs::set_permissions(&key_path, permissions)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
-                }
-                eprintln!("Client private key written to: {}", key_path.display());
-            } else {
-                println!("{}", bundle.private_key_pem.expose_secret());
+            let key_path = out_key.ok_or_else(|| {
+                anyhow::anyhow!("--out-key is required; refusing to print private key to stdout")
+            })?;
+            // Set restrictive permissions (600) on Unix systems
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
+                let metadata = fs::metadata(&key_path)?;
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                fs::set_permissions(&key_path, permissions)?;
             }
+            #[cfg(not(unix))]
+            {
+                fs::write(&key_path, bundle.private_key_pem.expose_secret())?;
+            }
+            eprintln!("Client private key written to: {}", key_path.display());
 
             eprintln!("Client certificate generated successfully");
         }

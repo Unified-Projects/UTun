@@ -29,7 +29,7 @@ rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.25"
 
 # Certificate generation
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 x509-parser = { version = "0.16", features = ["verify"] }
 x509-cert = { version = "0.2", features = ["pem", "builder"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }

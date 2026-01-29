@@ -1,4 +1,6 @@
 use clap::Parser;
+use std::sync::Arc;
+use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cert;
@@ -77,7 +79,7 @@ async fn run_source(config_path: std::path::PathBuf, args: cli::SourceArgs) -> a
 
     // Create and run source container
     tracing::info!("Starting UTun source container");
-    let source = tunnel::SourceContainer::new(source_config).await?;
+    let source = Arc::new(tunnel::SourceContainer::new(source_config, config.crypto).await?);
 
     // Start metrics server with health monitor
     if config.metrics.enabled {
@@ -90,8 +92,33 @@ async fn run_source(config_path: std::path::PathBuf, args: cli::SourceArgs) -> a
     }
 
     source.start().await?;
-    source.run().await?;
 
+    // Spawn the main run loop
+    let source_run = source.clone();
+    let run_handle = tokio::spawn(async move {
+        source_run.run().await
+    });
+
+    // Wait for shutdown signal
+    wait_for_shutdown_signal().await;
+
+    // Graceful shutdown
+    tracing::info!("Initiating graceful shutdown...");
+    source.stop().await;
+
+    // Wait for run loop to complete with timeout
+    match tokio::time::timeout(std::time::Duration::from_secs(30), run_handle).await {
+        Ok(result) => {
+            if let Err(e) = result {
+                tracing::error!("Run task panicked: {}", e);
+            }
+        }
+        Err(_) => {
+            tracing::warn!("Shutdown timed out after 30 seconds");
+        }
+    }
+
+    tracing::info!("Shutdown complete");
     Ok(())
 }
 
@@ -115,7 +142,7 @@ async fn run_dest(config_path: std::path::PathBuf, args: cli::DestArgs) -> anyho
 
     // Create and run destination container
     tracing::info!("Starting UTun destination container");
-    let dest = tunnel::DestContainer::new(dest_config).await?;
+    let dest = Arc::new(tunnel::DestContainer::new(dest_config, config.crypto).await?);
 
     // Start metrics server with health monitor
     if config.metrics.enabled {
@@ -128,8 +155,33 @@ async fn run_dest(config_path: std::path::PathBuf, args: cli::DestArgs) -> anyho
     }
 
     dest.start().await?;
-    dest.run().await?;
 
+    // Spawn the main run loop
+    let dest_run = dest.clone();
+    let run_handle = tokio::spawn(async move {
+        dest_run.run().await
+    });
+
+    // Wait for shutdown signal
+    wait_for_shutdown_signal().await;
+
+    // Graceful shutdown
+    tracing::info!("Initiating graceful shutdown...");
+    dest.stop().await;
+
+    // Wait for run loop to complete with timeout
+    match tokio::time::timeout(std::time::Duration::from_secs(30), run_handle).await {
+        Ok(result) => {
+            if let Err(e) = result {
+                tracing::error!("Run task panicked: {}", e);
+            }
+        }
+        Err(_) => {
+            tracing::warn!("Shutdown timed out after 30 seconds");
+        }
+    }
+
+    tracing::info!("Shutdown complete");
     Ok(())
 }
 
@@ -141,6 +193,35 @@ fn print_version() -> anyhow::Result<()> {
         option_env!("BUILD_TIMESTAMP").unwrap_or("unknown")
     );
     Ok(())
+}
+
+/// Wait for a shutdown signal (SIGTERM or SIGINT/Ctrl+C)
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received Ctrl+C (SIGINT)");
+        }
+        _ = terminate => {
+            tracing::info!("Received SIGTERM");
+        }
+    }
 }
 
 async fn check_health(args: cli::HealthArgs) -> anyhow::Result<()> {

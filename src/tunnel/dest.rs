@@ -2,7 +2,7 @@ use super::{
     ConnectionError, ConnectionManager, Frame, FrameCodec, FrameError, FrameType, HandshakeContext,
     HandshakeError, Protocol,
 };
-use crate::config::{DestConfig, ServiceConfig};
+use crate::config::{CryptoConfig, DestConfig, ServiceConfig};
 use crate::crypto::{DerivedKeyMaterial, KeyManager, SessionCrypto};
 use crate::health::{HealthMonitor, HealthStatus};
 use std::collections::HashMap;
@@ -18,14 +18,11 @@ use tokio::time::{timeout, Duration};
 // Maximum frame size to prevent memory exhaustion (1MB)
 const MAX_FRAME_SIZE: u32 = 1024 * 1024;
 
-// Maximum handshake message size (64KB - handshake messages are much smaller)
-const MAX_HANDSHAKE_SIZE: u32 = 64 * 1024;
-
 // Frame read timeout to prevent slowloris attacks (30 seconds)
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Handshake timeout (10 seconds per message)
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// Handshake timeout per message (increased for large McEliece keys)
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum DestError {
@@ -119,10 +116,12 @@ pub struct DestContainer {
     target_connections: Arc<RwLock<HashMap<u32, TargetConnection>>>,
     /// Channel to send response frames back to the tunnel
     response_tx: Arc<RwLock<Option<mpsc::Sender<Frame>>>>,
+    /// Maximum handshake message size (depends on KEM mode)
+    max_handshake_size: u32,
 }
 
 impl DestContainer {
-    pub async fn new(config: DestConfig) -> Result<Self, DestError> {
+    pub async fn new(config: DestConfig, crypto_config: CryptoConfig) -> Result<Self, DestError> {
         let key_manager = Arc::new(KeyManager::new(3600, 300)); // 1 hour rotation, 5 min window
         let connection_manager = Arc::new(ConnectionManager::new(
             config.max_connections_per_service * config.exposed_services.len(),
@@ -136,6 +135,14 @@ impl DestContainer {
         // Set initial status to Starting
         health_monitor.set_status(HealthStatus::Starting).await;
 
+        let max_handshake_size = crypto_config.effective_max_handshake_size();
+        tracing::info!(
+            "Using max handshake size: {} bytes ({} KB) for KEM mode {:?}",
+            max_handshake_size,
+            max_handshake_size / 1024,
+            crypto_config.kem_mode
+        );
+
         Ok(Self {
             config,
             key_manager,
@@ -147,6 +154,7 @@ impl DestContainer {
             health_monitor,
             target_connections: Arc::new(RwLock::new(HashMap::new())),
             response_tx: Arc::new(RwLock::new(None)),
+            max_handshake_size,
         })
     }
 
@@ -372,10 +380,10 @@ impl DestContainer {
             Err(_) => return Err(DestError::Timeout),
         };
 
-        if len > MAX_HANDSHAKE_SIZE {
+        if len > self.max_handshake_size {
             return Err(DestError::FrameTooLarge {
                 size: len,
-                max: MAX_HANDSHAKE_SIZE,
+                max: self.max_handshake_size,
             });
         }
 
@@ -405,10 +413,10 @@ impl DestContainer {
             Err(_) => return Err(DestError::Timeout),
         };
 
-        if len > MAX_HANDSHAKE_SIZE {
+        if len > self.max_handshake_size {
             return Err(DestError::FrameTooLarge {
                 size: len,
-                max: MAX_HANDSHAKE_SIZE,
+                max: self.max_handshake_size,
             });
         }
 
@@ -718,6 +726,7 @@ impl Clone for DestContainer {
             health_monitor: self.health_monitor.clone(),
             target_connections: self.target_connections.clone(),
             response_tx: self.response_tx.clone(),
+            max_handshake_size: self.max_handshake_size,
         }
     }
 }

@@ -1,0 +1,229 @@
+# Destination container configuration - Multi-service example
+# This demonstrates exposing multiple services of different types
+
+[dest]
+listen_ip = "0.0.0.0"
+tunnel_port = 9443
+max_connections_per_service = 100
+connection_timeout_ms = 15000
+target_connect_timeout_ms = 5000
+
+# SSH Service
+[[dest.exposed_services]]
+name = "ssh"
+port = 22
+target_ip = "10.0.1.10"
+target_port = 22
+protocol = "tcp"
+description = "SSH access to internal server"
+
+# Web Services
+[[dest.exposed_services]]
+name = "web-app"
+port = 80
+target_ip = "10.0.1.20"
+target_port = 8080
+protocol = "tcp"
+description = "Main web application"
+
+[[dest.exposed_services]]
+name = "web-app-https"
+port = 443
+target_ip = "10.0.1.20"
+target_port = 8443
+protocol = "tcp"
+description = "Main web application (HTTPS)"
+
+[[dest.exposed_services]]
+name = "api-server"
+port = 3000
+target_ip = "10.0.1.21"
+target_port = 3000
+protocol = "tcp"
+description = "REST API server"
+
+[[dest.exposed_services]]
+name = "graphql-api"
+port = 4000
+target_ip = "10.0.1.22"
+target_port = 4000
+protocol = "tcp"
+description = "GraphQL API endpoint"
+
+# Database Services
+[[dest.exposed_services]]
+name = "postgresql"
+port = 5432
+target_ip = "10.0.2.10"
+target_port = 5432
+protocol = "tcp"
+description = "PostgreSQL database"
+
+[[dest.exposed_services]]
+name = "mysql"
+port = 3306
+target_ip = "10.0.2.11"
+target_port = 3306
+protocol = "tcp"
+description = "MySQL database"
+
+[[dest.exposed_services]]
+name = "mongodb"
+port = 27017
+target_ip = "10.0.2.12"
+target_port = 27017
+protocol = "tcp"
+description = "MongoDB database"
+
+# Cache Services
+[[dest.exposed_services]]
+name = "redis"
+port = 6379
+target_ip = "10.0.3.10"
+target_port = 6379
+protocol = "tcp"
+description = "Redis cache server"
+
+[[dest.exposed_services]]
+name = "memcached"
+port = 11211
+target_ip = "10.0.3.11"
+target_port = 11211
+protocol = "tcp"
+description = "Memcached server"
+
+# Message Queues
+[[dest.exposed_services]]
+name = "rabbitmq"
+port = 5672
+target_ip = "10.0.4.10"
+target_port = 5672
+protocol = "tcp"
+description = "RabbitMQ message queue"
+
+[[dest.exposed_services]]
+name = "rabbitmq-management"
+port = 15672
+target_ip = "10.0.4.10"
+target_port = 15672
+protocol = "tcp"
+description = "RabbitMQ management UI"
+
+[[dest.exposed_services]]
+name = "kafka"
+port = 9092
+target_ip = "10.0.4.11"
+target_port = 9092
+protocol = "tcp"
+description = "Apache Kafka broker"
+
+# Search & Analytics
+[[dest.exposed_services]]
+name = "elasticsearch"
+port = 9200
+target_ip = "10.0.5.10"
+target_port = 9200
+protocol = "tcp"
+description = "Elasticsearch cluster"
+
+[[dest.exposed_services]]
+name = "kibana"
+port = 5601
+target_ip = "10.0.5.11"
+target_port = 5601
+protocol = "tcp"
+description = "Kibana dashboard"
+
+# Monitoring & Observability
+[[dest.exposed_services]]
+name = "prometheus"
+port = 9090
+target_ip = "10.0.6.10"
+target_port = 9090
+protocol = "tcp"
+description = "Prometheus metrics"
+
+[[dest.exposed_services]]
+name = "grafana"
+port = 3001
+target_ip = "10.0.6.11"
+target_port = 3000
+protocol = "tcp"
+description = "Grafana dashboards"
+
+[[dest.exposed_services]]
+name = "jaeger"
+port = 16686
+target_ip = "10.0.6.12"
+target_port = 16686
+protocol = "tcp"
+description = "Jaeger tracing UI"
+
+# UDP Services
+[[dest.exposed_services]]
+name = "dns"
+port = 53
+target_ip = "10.0.7.1"
+target_port = 53
+protocol = "udp"
+description = "Internal DNS resolver"
+
+[[dest.exposed_services]]
+name = "ntp"
+port = 123
+target_ip = "10.0.7.2"
+target_port = 123
+protocol = "udp"
+description = "NTP time server"
+
+[[dest.exposed_services]]
+name = "syslog"
+port = 514
+target_ip = "10.0.7.3"
+target_port = 514
+protocol = "udp"
+description = "Syslog aggregation"
+
+# Development Tools
+[[dest.exposed_services]]
+name = "jupyter"
+port = 8888
+target_ip = "10.0.8.10"
+target_port = 8888
+protocol = "tcp"
+description = "Jupyter notebook server"
+
+[[dest.exposed_services]]
+name = "vscode-server"
+port = 8080
+target_ip = "10.0.8.11"
+target_port = 8080
+protocol = "tcp"
+description = "VS Code server"
+
+[dest.connection_filter]
+allowed_source_ips = [
+    "172.28.1.10/32",  # Source container
+    "10.0.0.0/8",       # Internal network
+]
+
+[auth]
+use_mtls = true
+ca_cert_path = "/certs/ca.crt"
+server_cert_path = "/certs/server.crt"
+server_key_path = "/certs/server.key"
+verify_client_cert = true
+
+[crypto]
+kem_mode = "hybrid"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+[metrics]
+enabled = true
+metrics_port = 9091

@@ -1,0 +1,85 @@
+# Source container configuration - Multi-port example
+# This demonstrates exposing multiple ports for different protocols
+
+[source]
+listen_ip = "0.0.0.0"
+listen_port = 8443
+dest_host = "utun-dest"
+dest_tunnel_port = 9443
+max_connections = 10000
+connection_timeout_ms = 30000
+keep_alive_interval_ms = 30000
+
+[source.allowed_outbound]
+allowed_ips = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+]
+
+# Primary tunnel port (TCP + UDP)
+[[source.exposed_ports]]
+port = 8443
+protocol = "both"
+
+# Additional TCP ports for specific services
+[[source.exposed_ports]]
+port = 22
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 80
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 443
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 3000
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 3306
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 5432
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 6379
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 27017
+protocol = "tcp"
+
+# UDP ports
+[[source.exposed_ports]]
+port = 53
+protocol = "udp"
+
+[[source.exposed_ports]]
+port = 123
+protocol = "udp"
+
+[auth]
+use_mtls = true
+ca_cert_path = "/certs/ca.crt"
+client_cert_path = "/certs/client.crt"
+client_key_path = "/certs/client.key"
+
+[crypto]
+kem_mode = "hybrid"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+[metrics]
+enabled = true
+metrics_port = 9090

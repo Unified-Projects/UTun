@@ -1,0 +1,88 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    groups:
+      # Group all post-quantum crypto dependencies
+      pq-crypto:
+        patterns:
+          - "pqcrypto-*"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Group symmetric crypto dependencies
+      crypto:
+        patterns:
+          - "aes-*"
+          - "aead"
+          - "hkdf"
+          - "sha2"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Group TLS/certificate dependencies
+      tls:
+        patterns:
+          - "rustls"
+          - "tokio-rustls"
+          - "rcgen"
+          - "x509-*"
+          - "pem-*"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Group serialization dependencies
+      serialization:
+        patterns:
+          - "serde*"
+          - "toml"
+          - "bincode"
+          - "bytes"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Group async runtime dependencies
+      tokio:
+        patterns:
+          - "tokio*"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Group observability dependencies
+      observability:
+        patterns:
+          - "tracing*"
+          - "prometheus"
+        update-types:
+          - "minor"
+          - "patch"
+
+      # Group dev dependencies
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5

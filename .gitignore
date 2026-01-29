@@ -1,0 +1,53 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Certificates and keys (generated)
+/certs
+*.crt
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Configuration with secrets
+*.secret.toml
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Logs
+*.log
+logs/
+
+# Benchmarks
+/benches/results
+
+# Coverage
+/coverage
+*.profdata
+*.profraw
+lcov.info
+tarpaulin-report.html
+
+# Docker volumes
+/data
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup

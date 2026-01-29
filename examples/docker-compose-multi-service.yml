@@ -1,0 +1,155 @@
+version: '3.8'
+
+# Multi-service example showing how to expose many different types of services
+# This demonstrates databases, web services, caches, message queues, etc.
+
+services:
+  utun-source:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        BUILD_TIMESTAMP: ${BUILD_TIMESTAMP:-}
+    image: utun:latest
+    container_name: utun-source
+    command: source --config /etc/utun/config.toml
+    ports:
+      # Primary tunnel port (TCP + UDP)
+      - "8443:8443"
+      - "8443:8443/udp"
+
+      # SSH
+      - "22:22"
+
+      # Web services
+      - "80:80"
+      - "443:443"
+      - "3000:3000"
+      - "4000:4000"
+      - "8080:8080"
+      - "8888:8888"
+
+      # Databases
+      - "3306:3306"      # MySQL
+      - "5432:5432"      # PostgreSQL
+      - "27017:27017"    # MongoDB
+
+      # Cache
+      - "6379:6379"      # Redis
+      - "11211:11211"    # Memcached
+
+      # Message Queues
+      - "5672:5672"      # RabbitMQ
+      - "15672:15672"    # RabbitMQ Management
+      - "9092:9092"      # Kafka
+
+      # Search & Analytics
+      - "9200:9200"      # Elasticsearch
+      - "5601:5601"      # Kibana
+
+      # Monitoring
+      - "3001:3001"      # Grafana
+      - "16686:16686"    # Jaeger
+
+      # UDP Services
+      - "53:53/udp"      # DNS
+      - "123:123/udp"    # NTP
+      - "514:514/udp"    # Syslog
+
+      # Metrics endpoint
+      - "9090:9090"
+    volumes:
+      - ../certs/source:/certs:ro
+      - ./config-source-multi-port.toml:/etc/utun/config.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-0}
+    cap_add:
+      - NET_ADMIN
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.1.10
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/utun", "health", "--endpoint", "http://localhost:9090/health", "--timeout", "5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      utun-dest:
+        condition: service_healthy
+
+  utun-dest:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: utun:latest
+    container_name: utun-dest
+    command: dest --config /etc/utun/config.toml
+    ports:
+      # Tunnel port
+      - "9443:9443"
+
+      # Metrics endpoint
+      - "9091:9091"
+    volumes:
+      - ../certs/dest:/certs:ro
+      - ./config-dest-multi-service.toml:/etc/utun/config.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-0}
+    cap_add:
+      - NET_ADMIN
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.1.20
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/utun", "health", "--endpoint", "http://localhost:9091/health", "--timeout", "5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+  # Example backend services that utun-dest forwards to
+  # These demonstrate what the tunnel is connecting to
+
+  web-app:
+    image: nginx:alpine
+    container_name: backend-web
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.1.20
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: backend-postgres
+    environment:
+      POSTGRES_PASSWORD: example
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.2.10
+
+  redis:
+    image: redis:7-alpine
+    container_name: backend-redis
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.3.10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: backend-rabbitmq
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.4.10
+
+networks:
+  tunnel-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  utun-source:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_TIMESTAMP: ${BUILD_TIMESTAMP:-}
+    image: utun:latest
+    container_name: utun-source
+    command: source --config /etc/utun/config.toml
+    ports:
+      - "8443:8443"
+      - "8443:8443/udp"
+      - "9090:9090"
+    volumes:
+      - ./certs/source:/certs:ro
+      - ./examples/config-source.toml:/etc/utun/config.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-0}
+    cap_add:
+      - NET_ADMIN
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.1.10
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/utun", "health", "--endpoint", "http://localhost:9090/health", "--timeout", "5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      utun-dest:
+        condition: service_healthy
+
+  utun-dest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: utun:latest
+    container_name: utun-dest
+    command: dest --config /etc/utun/config.toml
+    ports:
+      - "9443:9443"
+      - "9091:9091"
+    volumes:
+      - ./certs/dest:/certs:ro
+      - ./examples/config-dest.toml:/etc/utun/config.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-0}
+    cap_add:
+      - NET_ADMIN
+    networks:
+      tunnel-net:
+        ipv4_address: 172.28.1.20
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/utun", "health", "--endpoint", "http://localhost:9091/health", "--timeout", "5"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  tunnel-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

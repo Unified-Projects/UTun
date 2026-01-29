@@ -1,0 +1,58 @@
+# Destination container configuration
+
+[dest]
+listen_ip = "0.0.0.0"
+tunnel_port = 9443
+max_connections_per_service = 100
+connection_timeout_ms = 15000
+target_connect_timeout_ms = 5000
+
+[[dest.exposed_services]]
+name = "ssh"
+port = 22
+target_ip = "127.0.0.1"
+target_port = 22
+protocol = "tcp"
+description = "SSH access"
+
+[[dest.exposed_services]]
+name = "http"
+port = 8080
+target_ip = "10.0.1.5"
+target_port = 8080
+protocol = "tcp"
+description = "HTTP API"
+
+[[dest.exposed_services]]
+name = "dns"
+port = 53
+target_ip = "10.0.1.1"
+target_port = 53
+protocol = "udp"
+description = "DNS resolver"
+
+[dest.connection_filter]
+allowed_source_ips = [
+    "172.28.1.10/32",
+]
+
+[auth]
+use_mtls = true
+ca_cert_path = "/certs/ca.crt"
+server_cert_path = "/certs/server.crt"
+server_key_path = "/certs/server.key"
+verify_client_cert = true
+
+[crypto]
+kem_mode = "hybrid"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+[metrics]
+enabled = true
+metrics_port = 9091

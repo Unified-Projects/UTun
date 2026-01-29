@@ -34,7 +34,7 @@ RUN cargo build --release
 # Runtime stage
 # Use specific version tag for reproducible builds
 # To get SHA256 digest: docker pull debian:bookworm-20240130-slim && docker inspect debian:bookworm-20240130-slim | grep RepoDigests
-FROM debian:bookworm-20240130-slim
+FROM debian:bookworm-20260112-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

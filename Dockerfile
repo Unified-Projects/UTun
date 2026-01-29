@@ -1,7 +1,7 @@
 # Build stage
 # Use specific version tag for reproducible builds
 # To get SHA256 digest: docker pull rust:1.75.0-bookworm && docker inspect rust:1.75.0-bookworm | grep RepoDigests
-FROM rust:1.75.0-bookworm AS builder
+FROM rust:1.93.0-bookworm AS builder
 
 WORKDIR /app
 

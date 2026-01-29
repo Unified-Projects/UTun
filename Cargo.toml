@@ -26,7 +26,7 @@ sha2 = "0.10"
 
 # TLS
 rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.25"
+tokio-rustls = "0.26"
 
 # Certificate generation
 rcgen = { version = "0.14.7", features = ["pem", "x509-parser"] }

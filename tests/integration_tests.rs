@@ -2,9 +2,13 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use utun::config::{CryptoConfig, KemMode};
+use utun::crypto::KeyManager;
+use utun::tunnel::HandshakeContext;
 
 /// Helper to start an echo server for testing
 async fn start_echo_server() -> Result<(SocketAddr, tokio::task::JoinHandle<()>), std::io::Error> {
@@ -294,4 +298,115 @@ async fn test_multiple_services_routing() {
     for handle in handles {
         handle.await.unwrap();
     }
+}
+
+/// Test that PEM certificates are properly loaded and can be used in handshake
+/// This tests the fix for PEM-to-DER conversion in HandshakeContext
+#[tokio::test]
+async fn test_pem_certificate_handshake() {
+    let cert_dir = tempdir().unwrap();
+    create_test_certs(cert_dir.path());
+
+    // Load PEM files from disk (as the real deployment does)
+    let ca_pem = std::fs::read(cert_dir.path().join("ca.crt")).unwrap();
+    let server_cert_pem = std::fs::read(cert_dir.path().join("server.crt")).unwrap();
+    let server_key_pem = std::fs::read(cert_dir.path().join("server.key")).unwrap();
+    let client_cert_pem = std::fs::read(cert_dir.path().join("client.crt")).unwrap();
+    let client_key_pem = std::fs::read(cert_dir.path().join("client.key")).unwrap();
+
+    // Verify they are PEM format (not DER)
+    assert!(ca_pem.starts_with(b"-----BEGIN"), "CA cert should be PEM format");
+    assert!(server_cert_pem.starts_with(b"-----BEGIN"), "Server cert should be PEM format");
+    assert!(client_cert_pem.starts_with(b"-----BEGIN"), "Client cert should be PEM format");
+
+    // Create handshake contexts with PEM data (this should work after the fix)
+    let key_manager = Arc::new(KeyManager::new(3600, 300));
+
+    let mut client_ctx = HandshakeContext::new_client(
+        key_manager.clone(),
+        client_cert_pem.clone(),
+        client_key_pem.clone(),
+        ca_pem.clone(),
+    );
+
+    let mut server_ctx = HandshakeContext::new_server(
+        key_manager.clone(),
+        server_cert_pem.clone(),
+        server_key_pem.clone(),
+        ca_pem.clone(),
+    );
+
+    // Perform handshake - this would fail before the PEM fix
+    let client_hello = client_ctx.create_client_hello().expect("Client hello should succeed");
+    let server_hello = server_ctx.process_client_hello(client_hello).await.expect("Server hello should succeed");
+    let client_finished = client_ctx.process_server_hello(server_hello).await.expect("Client finished should succeed");
+    let server_finished = server_ctx.process_client_finished(client_finished).await.expect("Server finished should succeed");
+    client_ctx.process_server_finished(server_finished).await.expect("Client should process server finished");
+
+    // Verify session keys were derived
+    assert!(client_ctx.get_session_key().is_some(), "Client should have session key");
+    assert!(server_ctx.get_session_key().is_some(), "Server should have session key");
+
+    // Verify both sides derived the same key
+    assert_eq!(
+        client_ctx.get_session_key().unwrap(),
+        server_ctx.get_session_key().unwrap(),
+        "Both sides should derive the same session key"
+    );
+}
+
+/// Test that max handshake size is correctly calculated for each KEM mode
+#[test]
+fn test_max_handshake_size_by_kem_mode() {
+    // ML-KEM-768 should use smaller buffer (64KB)
+    let mlkem_config = CryptoConfig {
+        kem_mode: KemMode::Mlkem768,
+        key_rotation_interval_seconds: 3600,
+        rehandshake_before_expiry_seconds: 300,
+        max_handshake_size: None,
+    };
+    assert_eq!(
+        mlkem_config.effective_max_handshake_size(),
+        64 * 1024,
+        "ML-KEM-768 should use 64KB handshake buffer"
+    );
+
+    // Hybrid mode should use larger buffer (2MB) for McEliece keys
+    let hybrid_config = CryptoConfig {
+        kem_mode: KemMode::Hybrid,
+        key_rotation_interval_seconds: 3600,
+        rehandshake_before_expiry_seconds: 300,
+        max_handshake_size: None,
+    };
+    assert_eq!(
+        hybrid_config.effective_max_handshake_size(),
+        2 * 1024 * 1024,
+        "Hybrid mode should use 2MB handshake buffer for McEliece"
+    );
+
+    // McEliece-only mode should also use larger buffer
+    let mceliece_config = CryptoConfig {
+        kem_mode: KemMode::Mceliece460896,
+        key_rotation_interval_seconds: 3600,
+        rehandshake_before_expiry_seconds: 300,
+        max_handshake_size: None,
+    };
+    assert_eq!(
+        mceliece_config.effective_max_handshake_size(),
+        2 * 1024 * 1024,
+        "McEliece mode should use 2MB handshake buffer"
+    );
+
+    // Custom override should be respected
+    let custom_config = CryptoConfig {
+        kem_mode: KemMode::Mlkem768,
+        key_rotation_interval_seconds: 3600,
+        rehandshake_before_expiry_seconds: 300,
+        max_handshake_size: Some(1024 * 1024), // 1MB override
+    };
+    assert_eq!(
+        custom_config.effective_max_handshake_size(),
+        1024 * 1024,
+        "Custom max_handshake_size should override default"
+    );
 }

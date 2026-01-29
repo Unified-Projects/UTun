@@ -9,10 +9,8 @@ use tokio::time::{timeout, Duration};
 // Maximum frame size to prevent memory exhaustion (1MB)
 const MAX_FRAME_SIZE: u32 = 1024 * 1024;
 
-// Maximum handshake message size (64KB)
-const MAX_HANDSHAKE_SIZE: u32 = 64 * 1024;
-
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+// Handshake timeout per message (increased for large McEliece keys)
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Frame read timeout (30 seconds)
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -20,7 +18,7 @@ use super::{
     ConnectionError, ConnectionManager, Frame, FrameCodec, FrameError, FrameType, HandshakeContext,
     HandshakeError, Protocol,
 };
-use crate::config::SourceConfig;
+use crate::config::{CryptoConfig, SourceConfig};
 use crate::crypto::{DerivedKeyMaterial, KeyManager, SessionCrypto};
 use crate::health::{HealthMonitor, HealthStatus};
 
@@ -82,10 +80,12 @@ pub struct SourceContainer {
     shutdown: watch::Sender<bool>,
     metrics: Arc<SourceMetrics>,
     health_monitor: Arc<HealthMonitor>,
+    /// Maximum handshake message size (depends on KEM mode)
+    max_handshake_size: u32,
 }
 
 impl SourceContainer {
-    pub async fn new(config: SourceConfig) -> Result<Self, SourceError> {
+    pub async fn new(config: SourceConfig, crypto_config: CryptoConfig) -> Result<Self, SourceError> {
         let key_manager = Arc::new(KeyManager::new(3600, 300)); // 1 hour rotation, 5 min window
         let connection_manager = Arc::new(ConnectionManager::new(
             config.max_connections,
@@ -98,6 +98,14 @@ impl SourceContainer {
         // Set initial status to Starting
         health_monitor.set_status(HealthStatus::Starting).await;
 
+        let max_handshake_size = crypto_config.effective_max_handshake_size();
+        tracing::info!(
+            "Using max handshake size: {} bytes ({} KB) for KEM mode {:?}",
+            max_handshake_size,
+            max_handshake_size / 1024,
+            crypto_config.kem_mode
+        );
+
         Ok(Self {
             config,
             key_manager,
@@ -107,6 +115,7 @@ impl SourceContainer {
             shutdown: shutdown_tx,
             metrics: Arc::new(SourceMetrics::new()),
             health_monitor,
+            max_handshake_size,
         })
     }
 
@@ -200,10 +209,10 @@ impl SourceContainer {
                 Err(_) => return Err(SourceError::Timeout),
             };
 
-            if len > MAX_HANDSHAKE_SIZE {
+            if len > self.max_handshake_size {
                 return Err(SourceError::FrameTooLarge {
                     size: len,
-                    max: MAX_HANDSHAKE_SIZE,
+                    max: self.max_handshake_size,
                 });
             }
 
@@ -245,10 +254,10 @@ impl SourceContainer {
                 Err(_) => return Err(SourceError::Timeout),
             };
 
-            if len > MAX_HANDSHAKE_SIZE {
+            if len > self.max_handshake_size {
                 return Err(SourceError::FrameTooLarge {
                     size: len,
-                    max: MAX_HANDSHAKE_SIZE,
+                    max: self.max_handshake_size,
                 });
             }
 
@@ -500,6 +509,7 @@ impl Clone for SourceContainer {
             shutdown: self.shutdown.clone(),
             metrics: self.metrics.clone(),
             health_monitor: self.health_monitor.clone(),
+            max_handshake_size: self.max_handshake_size,
         }
     }
 }

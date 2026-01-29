@@ -1,6 +1,6 @@
 [package]
 name = "utun"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["UTun Contributors"]
 description = "Quantum-safe tunnel system"
@@ -72,7 +72,7 @@ warp = { version = "0.4.2", features = ["server"] }
 rustc_version_runtime = "0.3"
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "net", "io-util", "io-std"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "signal"] }
 
 # HTTP client for health checks
 reqwest = { version = "0.13.1", features = ["json"] }

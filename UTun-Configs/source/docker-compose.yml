@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  utun-source:
+    image: unifiedprojects/utun:latest
+    container_name: utun-source
+    restart: unless-stopped
+    command: source --config /etc/utun/config.toml
+    ports:
+      # Client-facing port (applications connect here to reach port 80 on dest)
+      - "80:80"
+      # Metrics endpoint
+      - "9090:9090"
+    volumes:
+      - ./config.toml:/etc/utun/config.toml:ro
+      - ./certs:/certs:ro
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/utun", "health", "--endpoint", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    networks:
+      - utun-net
+
+networks:
+  utun-net:
+    driver: bridge

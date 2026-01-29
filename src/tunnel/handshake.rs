@@ -11,6 +11,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use x509_parser::prelude::*;
 
+/// Convert PEM-encoded certificate to DER format
+/// If already DER, returns as-is
+fn pem_to_der(data: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+    // Check if this looks like PEM (starts with -----BEGIN)
+    if data.starts_with(b"-----BEGIN") {
+        pem_rfc7468::decode_vec(data)
+            .map(|(_, der)| der)
+            .map_err(|e| HandshakeError::CertParseError(format!("PEM decode failed: {}", e)))
+    } else {
+        // Already DER
+        Ok(data.to_vec())
+    }
+}
+
 // KEM Algorithm Enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -151,6 +165,8 @@ pub struct HandshakeContext {
     transcript: Vec<u8>,
     client_random: [u8; 32],
     server_random: [u8; 32],
+    client_keypair: Option<crate::crypto::HybridKeyPair>,
+    server_keypair: Option<crate::crypto::HybridKeyPair>,
     client_public_key: Option<HybridPublicKey>,
     server_public_key: Option<HybridPublicKey>,
     shared_secret_client: Option<Vec<u8>>,
@@ -161,6 +177,8 @@ pub struct HandshakeContext {
     handshake_timestamp_ms: u64,
     /// Peer's timestamp for replay protection validation
     peer_timestamp_ms: Option<u64>,
+    /// Whether this context is for the client role (true) or server role (false)
+    is_client_role: bool,
 }
 
 /// Helper function to get current timestamp in milliseconds
@@ -221,14 +239,20 @@ impl HandshakeContext {
         _client_key: Vec<u8>, // Key not needed for PQC handshake, kept for API compat
         ca_cert: Vec<u8>,
     ) -> Self {
+        // Convert PEM to DER if needed
+        let ca_cert_der = pem_to_der(&ca_cert).unwrap_or_else(|_| ca_cert.clone());
+        let client_cert_der = pem_to_der(&client_cert).unwrap_or_else(|_| client_cert.clone());
+
         Self {
             state: HandshakeState::Idle,
             key_manager,
-            ca_cert,
-            our_cert: Some(client_cert),
+            ca_cert: ca_cert_der,
+            our_cert: Some(client_cert_der),
             transcript: Vec::new(),
             client_random: [0u8; 32],
             server_random: [0u8; 32],
+            client_keypair: None,
+            server_keypair: None,
             client_public_key: None,
             server_public_key: None,
             shared_secret_client: None,
@@ -236,6 +260,7 @@ impl HandshakeContext {
             expected_peer_hostname: None,
             handshake_timestamp_ms: 0,
             peer_timestamp_ms: None,
+            is_client_role: true,
         }
     }
 
@@ -259,14 +284,20 @@ impl HandshakeContext {
         _server_key: Vec<u8>, // Key not needed for PQC handshake, kept for API compat
         ca_cert: Vec<u8>,
     ) -> Self {
+        // Convert PEM to DER if needed
+        let ca_cert_der = pem_to_der(&ca_cert).unwrap_or_else(|_| ca_cert.clone());
+        let server_cert_der = pem_to_der(&server_cert).unwrap_or_else(|_| server_cert.clone());
+
         Self {
             state: HandshakeState::Idle,
             key_manager,
-            ca_cert,
-            our_cert: Some(server_cert),
+            ca_cert: ca_cert_der,
+            our_cert: Some(server_cert_der),
             transcript: Vec::new(),
             client_random: [0u8; 32],
             server_random: [0u8; 32],
+            client_keypair: None,
+            server_keypair: None,
             client_public_key: None,
             server_public_key: None,
             shared_secret_client: None,
@@ -274,6 +305,7 @@ impl HandshakeContext {
             expected_peer_hostname: None,
             handshake_timestamp_ms: 0,
             peer_timestamp_ms: None,
+            is_client_role: false,
         }
     }
 
@@ -299,11 +331,12 @@ impl HandshakeContext {
         // Record handshake timestamp for replay protection
         self.handshake_timestamp_ms = current_timestamp_ms();
 
-        // Generate ephemeral key pair
+        // Generate ephemeral key pair and store it for later decapsulation
         let keypair = self.key_manager.generate_ephemeral_keypair();
         let public_key_bytes = keypair.public_key().as_bytes().to_vec();
 
         self.client_public_key = Some(keypair.public_key().clone());
+        self.client_keypair = Some(keypair);
 
         let hello = ClientHello {
             version: crate::tunnel::PROTOCOL_VERSION,
@@ -377,10 +410,14 @@ impl HandshakeContext {
         let server_ct = HybridCiphertext::from_bytes(&hello.server_kex_ct)
             .map_err(|e| HandshakeError::KeyExchangeError(e.to_string()))?;
 
-        let client_keypair = self.key_manager.generate_ephemeral_keypair();
+        // Use the keypair we generated in create_client_hello to decapsulate
+        let client_keypair = self
+            .client_keypair
+            .as_ref()
+            .ok_or_else(|| HandshakeError::KeyExchangeError("Client keypair not found".to_string()))?;
         let shared_from_server = self
             .key_manager
-            .decapsulate_hybrid(&client_keypair, &server_ct)
+            .decapsulate_hybrid(client_keypair, &server_ct)
             .map_err(|e| HandshakeError::KeyExchangeError(e.to_string()))?;
 
         self.shared_secret_server = Some(shared_from_server.as_bytes().to_vec());
@@ -429,17 +466,18 @@ impl HandshakeContext {
             });
         }
 
-        // Add to transcript
-        let finished_bytes = bincode::serialize(&finished)
-            .map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
-        self.transcript.extend_from_slice(&finished_bytes);
-
-        // Verify server's verify_data
+        // IMPORTANT: Verify server's verify_data BEFORE adding server_finished to transcript
+        // The server computed verify_data before adding server_finished, so we must too
         let expected_verify_data = self.calculate_verify_data(false);
         if finished.verify_data != expected_verify_data {
             self.state = HandshakeState::Failed;
             return Err(HandshakeError::VerificationFailed);
         }
+
+        // Add to transcript AFTER verifying
+        let finished_bytes = bincode::serialize(&finished)
+            .map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
+        self.transcript.extend_from_slice(&finished_bytes);
 
         self.state = HandshakeState::Established;
         Ok(())
@@ -491,11 +529,12 @@ impl HandshakeContext {
         let mut rng = rand::rng();
         rng.fill_bytes(&mut self.server_random);
 
-        // Generate ephemeral keypair
+        // Generate ephemeral keypair and store it for later decapsulation
         let server_keypair = self.key_manager.generate_ephemeral_keypair();
         let server_public_key_bytes = server_keypair.public_key().as_bytes().to_vec();
 
         self.server_public_key = Some(server_keypair.public_key().clone());
+        self.server_keypair = Some(server_keypair);
 
         // Encapsulate to client's public key
         let (shared_to_client, server_ct) = self
@@ -553,26 +592,30 @@ impl HandshakeContext {
         let client_ct = HybridCiphertext::from_bytes(&finished.client_kex_ct)
             .map_err(|e| HandshakeError::KeyExchangeError(e.to_string()))?;
 
-        // Decapsulate client's ciphertext
-        let server_keypair = self.key_manager.generate_ephemeral_keypair();
+        // Use the keypair we generated in process_client_hello to decapsulate
+        let server_keypair = self
+            .server_keypair
+            .as_ref()
+            .ok_or_else(|| HandshakeError::KeyExchangeError("Server keypair not found".to_string()))?;
         let shared_from_client = self
             .key_manager
-            .decapsulate_hybrid(&server_keypair, &client_ct)
+            .decapsulate_hybrid(server_keypair, &client_ct)
             .map_err(|e| HandshakeError::KeyExchangeError(e.to_string()))?;
 
         self.shared_secret_server = Some(shared_from_client.as_bytes().to_vec());
 
-        // Add to transcript
-        let finished_bytes = bincode::serialize(&finished)
-            .map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
-        self.transcript.extend_from_slice(&finished_bytes);
-
-        // Verify client's verify_data
+        // IMPORTANT: Verify client's verify_data BEFORE adding client_finished to transcript
+        // The client computed verify_data before adding client_finished, so we must too
         let expected_verify_data = self.calculate_verify_data(true);
         if finished.verify_data != expected_verify_data {
             self.state = HandshakeState::Failed;
             return Err(HandshakeError::VerificationFailed);
         }
+
+        // Add client_finished to transcript AFTER verifying
+        let finished_bytes = bincode::serialize(&finished)
+            .map_err(|e| HandshakeError::SerializationError(e.to_string()))?;
+        self.transcript.extend_from_slice(&finished_bytes);
 
         // Calculate server's verify_data
         let verify_data = self.calculate_verify_data(false);
@@ -603,13 +646,31 @@ impl HandshakeContext {
             return None;
         }
 
-        // Combine both shared secrets
+        // IMPORTANT: Use canonical order for shared secrets (client_to_server, server_to_client)
+        // regardless of which side is computing, to ensure both sides derive the same key.
+        //
+        // The naming is from each side's local perspective:
+        // - CLIENT's shared_secret_client = client encap to server pubkey (client -> server)
+        // - CLIENT's shared_secret_server = client decap of server's ct (server -> client)
+        // - SERVER's shared_secret_client = server encap to client pubkey (server -> client)
+        // - SERVER's shared_secret_server = server decap of client's ct (client -> server)
+        //
+        // So the mapping to canonical direction is:
+        // - client_to_server = CLIENT's ss_client = SERVER's ss_server
+        // - server_to_client = CLIENT's ss_server = SERVER's ss_client
+        let (client_to_server_ss, server_to_client_ss) = if self.is_client_role {
+            (&self.shared_secret_client, &self.shared_secret_server)
+        } else {
+            (&self.shared_secret_server, &self.shared_secret_client)
+        };
+
+        // Combine both shared secrets in canonical order
         let mut combined = Vec::new();
-        if let Some(ref ss_client) = self.shared_secret_client {
-            combined.extend_from_slice(ss_client);
+        if let Some(ref ss) = client_to_server_ss {
+            combined.extend_from_slice(ss);
         }
-        if let Some(ref ss_server) = self.shared_secret_server {
-            combined.extend_from_slice(ss_server);
+        if let Some(ref ss) = server_to_client_ss {
+            combined.extend_from_slice(ss);
         }
 
         if combined.is_empty() {
@@ -634,16 +695,42 @@ impl HandshakeContext {
         hasher.update(if is_client { b"client" } else { b"server" });
 
         // Include timestamps in verify_data for replay protection
-        hasher.update(self.handshake_timestamp_ms.to_le_bytes());
-        if let Some(peer_ts) = self.peer_timestamp_ms {
-            hasher.update(peer_ts.to_le_bytes());
-        }
+        // IMPORTANT: Use canonical order (client_ts, server_ts) regardless of which side
+        // is computing, to ensure both sides compute the same hash.
+        // For client role: handshake_timestamp_ms is client_ts, peer_timestamp_ms is server_ts
+        // For server role: handshake_timestamp_ms is server_ts, peer_timestamp_ms is client_ts
+        let (client_ts, server_ts) = if self.is_client_role {
+            (self.handshake_timestamp_ms, self.peer_timestamp_ms.unwrap_or(0))
+        } else {
+            (self.peer_timestamp_ms.unwrap_or(0), self.handshake_timestamp_ms)
+        };
 
-        if let Some(ref ss_client) = self.shared_secret_client {
-            hasher.update(ss_client);
+        hasher.update(client_ts.to_le_bytes());
+        hasher.update(server_ts.to_le_bytes());
+
+        // IMPORTANT: Use canonical order for shared secrets (client_to_server, server_to_client)
+        // regardless of which side is computing, to ensure both sides compute the same hash.
+        //
+        // The naming is from each side's local perspective:
+        // - CLIENT's shared_secret_client = client encap to server pubkey (client -> server)
+        // - CLIENT's shared_secret_server = client decap of server's ct (server -> client)
+        // - SERVER's shared_secret_client = server encap to client pubkey (server -> client)
+        // - SERVER's shared_secret_server = server decap of client's ct (client -> server)
+        //
+        // So the mapping to canonical direction is:
+        // - client_to_server = CLIENT's ss_client = SERVER's ss_server
+        // - server_to_client = CLIENT's ss_server = SERVER's ss_client
+        let (client_to_server_ss, server_to_client_ss) = if self.is_client_role {
+            (&self.shared_secret_client, &self.shared_secret_server)
+        } else {
+            (&self.shared_secret_server, &self.shared_secret_client)
+        };
+
+        if let Some(ref ss) = client_to_server_ss {
+            hasher.update(ss);
         }
-        if let Some(ref ss_server) = self.shared_secret_server {
-            hasher.update(ss_server);
+        if let Some(ref ss) = server_to_client_ss {
+            hasher.update(ss);
         }
 
         let result = hasher.finalize();

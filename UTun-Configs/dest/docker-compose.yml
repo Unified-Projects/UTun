@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  utun-dest:
+    image: unifiedprojects/utun:latest
+    container_name: utun-dest
+    restart: unless-stopped
+    command: dest --config /etc/utun/config.toml
+    ports:
+      # Tunnel endpoint (source connects here)
+      - "5983:5983"
+      # Metrics endpoint
+      - "9091:9091"
+    volumes:
+      - ./config.toml:/etc/utun/config.toml:ro
+      - ./certs:/certs:ro
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/utun", "health", "--endpoint", "http://localhost:9091/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    networks:
+      - utun-net
+
+networks:
+  utun-net:
+    driver: bridge

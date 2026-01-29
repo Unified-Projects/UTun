@@ -1,0 +1,48 @@
+# UTun Source Configuration
+# This runs on the SOURCE server - clients connect here to access services on DEST
+
+[source]
+# Local listening address for client connections
+listen_ip = "0.0.0.0"
+listen_port = 80
+
+# Destination server details (replace with your DEST server IP)
+dest_host = "37.187.159.141"
+dest_tunnel_port = 5983
+
+# Connection settings
+max_connections = 10000
+connection_timeout_ms = 30000
+keep_alive_interval_ms = 30000
+
+[source.allowed_outbound]
+# IPs allowed to be reached through the tunnel
+allowed_ips = ["0.0.0.0/0"]
+
+[[source.exposed_ports]]
+port = 80
+protocol = "tcp"
+
+# mTLS Authentication
+[auth]
+use_mtls = true
+ca_cert_path = "/certs/ca.crt"
+client_cert_path = "/certs/client.crt"
+client_key_path = "/certs/client.key"
+
+# Post-Quantum Cryptography Settings
+[crypto]
+kem_mode = "mlkem768"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+# Logging
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+# Metrics
+[metrics]
+enabled = true
+metrics_port = 9090

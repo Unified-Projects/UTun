@@ -449,10 +449,11 @@ mod tests {
         let result1 = keypair.decapsulate(&invalid_ct1);
         let result2 = keypair.decapsulate(&invalid_ct2);
 
-        if result1.is_ok() && result2.is_ok() {
-            assert_ne!(result1.unwrap().data, result2.unwrap().data);
-        } else {
-            assert!(result1.is_err() || result2.is_err());
+        match (result1, result2) {
+            (Ok(secret1), Ok(secret2)) => {
+                assert_ne!(secret1.data, secret2.data);
+            }
+            (Err(_), _) | (_, Err(_)) => {}
         }
     }
 

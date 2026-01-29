@@ -315,9 +315,18 @@ async fn test_pem_certificate_handshake() {
     let client_key_pem = std::fs::read(cert_dir.path().join("client.key")).unwrap();
 
     // Verify they are PEM format (not DER)
-    assert!(ca_pem.starts_with(b"-----BEGIN"), "CA cert should be PEM format");
-    assert!(server_cert_pem.starts_with(b"-----BEGIN"), "Server cert should be PEM format");
-    assert!(client_cert_pem.starts_with(b"-----BEGIN"), "Client cert should be PEM format");
+    assert!(
+        ca_pem.starts_with(b"-----BEGIN"),
+        "CA cert should be PEM format"
+    );
+    assert!(
+        server_cert_pem.starts_with(b"-----BEGIN"),
+        "Server cert should be PEM format"
+    );
+    assert!(
+        client_cert_pem.starts_with(b"-----BEGIN"),
+        "Client cert should be PEM format"
+    );
 
     // Create handshake contexts with PEM data (this should work after the fix)
     let key_manager = Arc::new(KeyManager::new(3600, 300));
@@ -337,15 +346,35 @@ async fn test_pem_certificate_handshake() {
     );
 
     // Perform handshake - this would fail before the PEM fix
-    let client_hello = client_ctx.create_client_hello().expect("Client hello should succeed");
-    let server_hello = server_ctx.process_client_hello(client_hello).await.expect("Server hello should succeed");
-    let client_finished = client_ctx.process_server_hello(server_hello).await.expect("Client finished should succeed");
-    let server_finished = server_ctx.process_client_finished(client_finished).await.expect("Server finished should succeed");
-    client_ctx.process_server_finished(server_finished).await.expect("Client should process server finished");
+    let client_hello = client_ctx
+        .create_client_hello()
+        .expect("Client hello should succeed");
+    let server_hello = server_ctx
+        .process_client_hello(client_hello)
+        .await
+        .expect("Server hello should succeed");
+    let client_finished = client_ctx
+        .process_server_hello(server_hello)
+        .await
+        .expect("Client finished should succeed");
+    let server_finished = server_ctx
+        .process_client_finished(client_finished)
+        .await
+        .expect("Server finished should succeed");
+    client_ctx
+        .process_server_finished(server_finished)
+        .await
+        .expect("Client should process server finished");
 
     // Verify session keys were derived
-    assert!(client_ctx.get_session_key().is_some(), "Client should have session key");
-    assert!(server_ctx.get_session_key().is_some(), "Server should have session key");
+    assert!(
+        client_ctx.get_session_key().is_some(),
+        "Client should have session key"
+    );
+    assert!(
+        server_ctx.get_session_key().is_some(),
+        "Server should have session key"
+    );
 
     // Verify both sides derived the same key
     assert_eq!(

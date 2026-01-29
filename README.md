@@ -4,7 +4,7 @@ High-performance quantum-resistant tunneling system built in Rust. Provides secu
 
 ## Features
 
-- **Post-Quantum Cryptography**: Hybrid KEM using Kyber-768 and Classic McEliece-460896
+- **Post-Quantum Cryptography**: Hybrid KEM using ML-KEM-768 (FIPS 203) and Classic McEliece-460896
 - **Strong Encryption**: AES-256-GCM symmetric encryption with HKDF key derivation
 - **Mutual TLS**: Certificate-based authentication with custom CA support
 - **Key Rotation**: Automatic cryptographic key rotation and session rekeying
@@ -170,7 +170,12 @@ utun cert client \
   --common-name "client1" \
   --ca-cert ca.crt --ca-key ca.key \
   --out-cert client.crt --out-key client.key
+```
 
+Note: for security, certificate and key material must be written to files via
+`--out-cert`/`--out-key` rather than printed to stdout.
+
+```bash
 # Show certificate details
 utun cert show server.crt
 
@@ -299,8 +304,8 @@ Balance security and performance by tuning `key_rotation_interval_seconds`. Shor
 
 ### KEM Mode
 
-- `hybrid`: Maximum security with both Kyber-768 and McEliece (default)
-- `mlkem768`: Faster, uses only Kyber-768
+- `hybrid`: Maximum security with both ML-KEM-768 and McEliece (default)
+- `mlkem768`: Faster, uses only ML-KEM-768
 - `mceliece460896`: Uses only Classic McEliece
 
 ## Troubleshooting
@@ -333,7 +338,7 @@ If experiencing slow performance:
 ### Hybrid Key Encapsulation Mechanism (KEM)
 
 The hybrid KEM combines two post-quantum algorithms:
-- **Kyber768** (CRYSTALS-Kyber): Lattice-based KEM, NIST Level 3 security
+- **ML-KEM-768** (FIPS 203, derived from Kyber): Lattice-based KEM, NIST Level 3 security
 - **Classic McEliece 460896**: Code-based KEM, conservative PQ security
 
 Key sizes:

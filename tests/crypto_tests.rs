@@ -212,8 +212,9 @@ mod symmetric_tests {
     fn test_session_crypto_roundtrip() {
         let mut enc_key = [0u8; 32];
         let mut mac_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut enc_key);
-        rand::thread_rng().fill_bytes(&mut mac_key);
+        let mut rng = rand::rng();
+        rng.fill_bytes(&mut enc_key);
+        rng.fill_bytes(&mut mac_key);
 
         let key_material = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
         let session = SessionCrypto::from_key_material(&key_material);

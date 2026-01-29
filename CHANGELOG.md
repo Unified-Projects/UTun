@@ -7,10 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-01-27
+## [0.1.0] - 2026-01-29
 
 ### Added
-- Post-quantum cryptography with hybrid KEM (Kyber-768 + Classic McEliece-460896)
+- Post-quantum cryptography with hybrid KEM (ML-KEM-768 + Classic McEliece-460896)
 - AES-256-GCM symmetric encryption with HKDF key derivation
 - Mutual TLS authentication with custom CA support
 - Automatic key rotation and session rekeying
@@ -28,3 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Certificate management utilities
 - Example configurations
 - Build scripts and Docker support
+
+### Changed
+- Switched the hybrid KEM from Kyber-768 to ML-KEM-768 (pqcrypto-mlkem)
+- Certificate CLI now requires `--out-cert`/`--out-key` and will not print PEM material to stdout

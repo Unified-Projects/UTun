@@ -5,7 +5,7 @@ use utun::crypto::{hybrid_kem::HybridKeyPair, symmetric::SymmetricCrypto};
 
 fn benchmark_key_generation(c: &mut Criterion) {
     c.bench_function("hybrid_keypair_generate", |b| {
-        b.iter(|| HybridKeyPair::generate())
+        b.iter(HybridKeyPair::generate)
     });
 }
 

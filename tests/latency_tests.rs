@@ -4,8 +4,9 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn start_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn start_echo_server(
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), std::io::Error> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
@@ -24,12 +25,28 @@ async fn start_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
         }
     });
 
-    (addr, handle)
+    Ok((addr, handle))
+}
+
+async fn start_echo_server_or_skip(
+    test_name: &str,
+) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    match start_echo_server().await {
+        Ok(result) => Some(result),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping {test_name}: {err}");
+            None
+        }
+        Err(err) => panic!("{test_name}: failed to start echo server: {err}"),
+    }
 }
 
 #[tokio::test]
 async fn measure_baseline_latency() {
-    let (addr, _handle) = start_echo_server().await;
+    let (addr, _handle) = match start_echo_server_or_skip("measure_baseline_latency").await {
+        Some(result) => result,
+        None => return,
+    };
     let mut client = TcpStream::connect(addr).await.unwrap();
 
     // Warm up

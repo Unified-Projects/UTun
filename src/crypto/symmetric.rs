@@ -3,7 +3,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use lru::LruCache;
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +46,9 @@ impl SymmetricCrypto {
         let cipher = Aes256Gcm::new(key.into());
         // Generate a random 4-byte session prefix for nonce construction
         let mut session_prefix = [0u8; 4];
-        OsRng.fill_bytes(&mut session_prefix);
+        OsRng
+            .try_fill_bytes(&mut session_prefix)
+            .expect("OS RNG failure");
         Self {
             cipher,
             session_prefix,

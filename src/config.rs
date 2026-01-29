@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum ConfigError {
     #[error("Failed to read config file: {0}")]
     ReadError(#[from] std::io::Error),

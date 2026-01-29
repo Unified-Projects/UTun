@@ -1,6 +1,6 @@
 use hkdf::Hkdf;
 use pqcrypto_classicmceliece::mceliece460896;
-use pqcrypto_kyber::kyber768;
+use pqcrypto_mlkem::mlkem768;
 use pqcrypto_traits::kem::{Ciphertext, PublicKey, SecretKey, SharedSecret};
 use sha2::Sha384;
 use std::ops::Deref;
@@ -8,7 +8,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // Constants for key sizes
-// Kyber768 (equivalent to ML-KEM-768)
+// ML-KEM-768 (FIPS 203, derived from Kyber)
 pub const KYBER768_PUBLIC_KEY_BYTES: usize = 1184;
 pub const KYBER768_SECRET_KEY_BYTES: usize = 2400;
 pub const KYBER768_CIPHERTEXT_BYTES: usize = 1088;
@@ -244,7 +244,7 @@ impl DerivedKeyMaterial {
 }
 
 pub struct HybridKeyPair {
-    mlkem_sk: Box<kyber768::SecretKey>,
+    mlkem_sk: Box<mlkem768::SecretKey>,
     mc_sk: Box<mceliece460896::SecretKey>,
     combined_public_key: HybridPublicKey,
     combined_secret_key: HybridSecretKey,
@@ -252,7 +252,7 @@ pub struct HybridKeyPair {
 
 impl HybridKeyPair {
     pub fn generate() -> Self {
-        let (mlkem_pk, mlkem_sk) = kyber768::keypair();
+        let (mlkem_pk, mlkem_sk) = mlkem768::keypair();
         let (mc_pk, mc_sk) = mceliece460896::keypair();
 
         let mut combined_pk_data = Vec::with_capacity(HYBRID_PUBLIC_KEY_BYTES);
@@ -292,12 +292,12 @@ impl HybridKeyPair {
         let peer_mlkem_pk_bytes = peer_pk.mlkem_public_key();
         let peer_mc_pk_bytes = peer_pk.mceliece_public_key();
 
-        let peer_mlkem_pk = kyber768::PublicKey::from_bytes(peer_mlkem_pk_bytes)
+        let peer_mlkem_pk = mlkem768::PublicKey::from_bytes(peer_mlkem_pk_bytes)
             .map_err(|_| HybridKEMError::InvalidPublicKey)?;
         let peer_mc_pk = mceliece460896::PublicKey::from_bytes(peer_mc_pk_bytes)
             .map_err(|_| HybridKEMError::InvalidPublicKey)?;
 
-        let (mlkem_ss, mlkem_ct) = kyber768::encapsulate(&peer_mlkem_pk);
+        let (mlkem_ss, mlkem_ct) = mlkem768::encapsulate(&peer_mlkem_pk);
         let (mc_ss, mc_ct) = mceliece460896::encapsulate(&peer_mc_pk);
 
         let mut combined_ct_data = Vec::with_capacity(HYBRID_CIPHERTEXT_BYTES);
@@ -337,12 +337,12 @@ impl HybridKeyPair {
         let mlkem_ct_bytes = ciphertext.mlkem_ciphertext();
         let mc_ct_bytes = ciphertext.mceliece_ciphertext();
 
-        let mlkem_ct = kyber768::Ciphertext::from_bytes(mlkem_ct_bytes)
+        let mlkem_ct = mlkem768::Ciphertext::from_bytes(mlkem_ct_bytes)
             .map_err(|_| HybridKEMError::InvalidCiphertext)?;
         let mc_ct = mceliece460896::Ciphertext::from_bytes(mc_ct_bytes)
             .map_err(|_| HybridKEMError::InvalidCiphertext)?;
 
-        let mlkem_ss = kyber768::decapsulate(&mlkem_ct, &self.mlkem_sk);
+        let mlkem_ss = mlkem768::decapsulate(&mlkem_ct, &self.mlkem_sk);
         let mc_ss = mceliece460896::decapsulate(&mc_ct, &self.mc_sk);
 
         let salt = ciphertext.as_bytes();

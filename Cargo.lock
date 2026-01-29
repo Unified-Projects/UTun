@@ -2780,7 +2780,7 @@ dependencies = [
  "socket2 0.5.10",
  "spki",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-test",

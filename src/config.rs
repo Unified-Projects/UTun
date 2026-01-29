@@ -130,15 +130,13 @@ pub struct CryptoConfig {
 impl CryptoConfig {
     /// Get the effective max handshake size based on KEM mode
     pub fn effective_max_handshake_size(&self) -> u32 {
-        self.max_handshake_size.unwrap_or_else(|| {
-            match self.kem_mode {
-                // ML-KEM-768 has ~1.5KB keys, 64KB is plenty
-                KemMode::Mlkem768 => 64 * 1024,
-                // Classic McEliece has ~500KB public keys, need 2MB for safety
-                KemMode::Mceliece460896 => 2 * 1024 * 1024,
-                // Hybrid uses both, so needs the larger buffer
-                KemMode::Hybrid => 2 * 1024 * 1024,
-            }
+        self.max_handshake_size.unwrap_or(match self.kem_mode {
+            // ML-KEM-768 has ~1.5KB keys, 64KB is plenty
+            KemMode::Mlkem768 => 64 * 1024,
+            // Classic McEliece has ~500KB public keys, need 2MB for safety
+            KemMode::Mceliece460896 => 2 * 1024 * 1024,
+            // Hybrid uses both, so needs the larger buffer
+            KemMode::Hybrid => 2 * 1024 * 1024,
         })
     }
 }

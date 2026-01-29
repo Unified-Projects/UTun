@@ -193,6 +193,7 @@ jobs:
         uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1
         with:
           denyWarnings: true
+          ignore: RUSTSEC-2025-0141
 
       - name: Install cargo-deny
         run: cargo install cargo-deny

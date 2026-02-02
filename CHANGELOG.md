@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-02-02
+
+### Fixed
+- Added safe config reload with blue/green swap so invalid configs no longer
+  crash the running container.
+
 ## [0.1.1] - 2026-01-29
 
 ### Fixed

@@ -116,7 +116,7 @@ fn spawn_config_watcher(config_path: PathBuf) -> mpsc::Receiver<()> {
             interval.tick().await;
             match read_file_stamp(&config_path).await {
                 Ok(stamp) => {
-                    let changed = last_stamp.map_or(true, |prev| prev != stamp);
+                    let changed = last_stamp != Some(stamp);
                     if changed {
                         last_stamp = Some(stamp);
                         if tx.send(()).await.is_err() {

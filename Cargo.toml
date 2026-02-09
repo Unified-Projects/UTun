@@ -84,7 +84,7 @@ windows = { version = "0.62", features = ["Win32_Security", "Win32_Security_Auth
 [dev-dependencies]
 criterion = "0.8"
 tokio-test = "0.4"
-tempfile = "3.10"
+tempfile = "3.25"
 
 [[bench]]
 name = "crypto_bench"

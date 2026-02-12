@@ -197,18 +197,13 @@ impl Protocol {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceMode {
+    #[default]
     Transparent,
     Protocol,
     Hybrid,
-}
-
-impl Default for SourceMode {
-    fn default() -> Self {
-        SourceMode::Transparent
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -415,7 +410,7 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
             SourceMode::Transparent | SourceMode::Hybrid => {
                 if source.exposed_ports.is_empty() {
                     return Err(ConfigError::ValidationError(
-                        "Transparent/Hybrid mode requires at least one exposed_port".to_string()
+                        "Transparent/Hybrid mode requires at least one exposed_port".to_string(),
                     ));
                 }
             }

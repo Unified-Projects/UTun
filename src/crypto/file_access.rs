@@ -179,15 +179,32 @@ fn build_diagnostics(
     let mut diag = String::new();
 
     diag.push_str(&format!("- File path: {}\n", file_path.display()));
-    diag.push_str(&format!("- File type: {}\n", if is_private_key { "Private Key" } else { "Certificate" }));
-    diag.push_str(&format!("- Running in container: {}\n", if is_running_in_container() { "Yes" } else { "No" }));
+    diag.push_str(&format!(
+        "- File type: {}\n",
+        if is_private_key {
+            "Private Key"
+        } else {
+            "Certificate"
+        }
+    ));
+    diag.push_str(&format!(
+        "- Running in container: {}\n",
+        if is_running_in_container() {
+            "Yes"
+        } else {
+            "No"
+        }
+    ));
 
     #[cfg(unix)]
     {
         let current_uid = get_current_uid();
         let current_user = get_current_username();
 
-        diag.push_str(&format!("- Current UID: {} ({})\n", current_uid, current_user));
+        diag.push_str(&format!(
+            "- Current UID: {} ({})\n",
+            current_uid, current_user
+        ));
 
         if let Some(uid) = file_owner_uid {
             diag.push_str(&format!("- File owner UID: {}\n", uid));
@@ -210,9 +227,15 @@ fn build_diagnostics(
 
             diag.push_str(&format!(
                 "{}{}{}{}{}{}{}{}{}))",
-                owner_read, owner_write, owner_exec,
-                group_read, group_write, group_exec,
-                other_read, other_write, other_exec
+                owner_read,
+                owner_write,
+                owner_exec,
+                group_read,
+                group_write,
+                group_exec,
+                other_read,
+                other_write,
+                other_exec
             ));
         }
     }
@@ -245,7 +268,11 @@ fn generate_fix_suggestion(
                 if owner_uid != current_uid {
                     suggestion.push_str(&format!(
                         "The {} file is owned by UID {}, but the container runs as UID {}.\n\n",
-                        if is_private_key { "private key" } else { "certificate" },
+                        if is_private_key {
+                            "private key"
+                        } else {
+                            "certificate"
+                        },
                         owner_uid,
                         current_uid
                     ));
@@ -255,7 +282,8 @@ fn generate_fix_suggestion(
                         "  sudo chown -R {}:{} {}\n\n",
                         current_uid,
                         current_uid,
-                        file_path.parent()
+                        file_path
+                            .parent()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| file_path.display().to_string())
                     ));
@@ -270,7 +298,9 @@ fn generate_fix_suggestion(
                     ));
 
                     suggestion.push_str("Option 3: Use a bind mount with proper ownership\n");
-                    suggestion.push_str("  Create certificates with the container user's UID before mounting\n");
+                    suggestion.push_str(
+                        "  Create certificates with the container user's UID before mounting\n",
+                    );
 
                     return suggestion;
                 }
@@ -287,7 +317,9 @@ fn generate_fix_suggestion(
                     if perm_bits & 0o077 != 0 {
                         suggestion.push_str("Private key file has insecure permissions (readable by group or others).\n\n");
                     } else {
-                        suggestion.push_str("Private key file permissions are too restrictive or incorrect.\n\n");
+                        suggestion.push_str(
+                            "Private key file permissions are too restrictive or incorrect.\n\n",
+                        );
                     }
 
                     suggestion.push_str("Fix with:\n");
@@ -324,10 +356,7 @@ fn generate_fix_suggestion(
                     ));
 
                     if is_private_key {
-                        suggestion.push_str(&format!(
-                            "  chmod 0600 {}\n",
-                            file_path.display()
-                        ));
+                        suggestion.push_str(&format!("  chmod 0600 {}\n", file_path.display()));
                     }
 
                     return suggestion;
@@ -340,19 +369,32 @@ fn generate_fix_suggestion(
 
         if in_container {
             suggestion.push_str("Verify:\n");
-            suggestion.push_str(&format!("1. File ownership matches container UID ({})\n", current_uid));
+            suggestion.push_str(&format!(
+                "1. File ownership matches container UID ({})\n",
+                current_uid
+            ));
             if is_private_key {
                 suggestion.push_str("2. Private key has 0600 permissions\n");
             } else {
                 suggestion.push_str("2. Certificate file is readable\n");
             }
-            suggestion.push_str("3. Volume mounts are configured correctly in docker-compose.yml\n");
+            suggestion
+                .push_str("3. Volume mounts are configured correctly in docker-compose.yml\n");
         } else {
             suggestion.push_str("Check:\n");
-            suggestion.push_str(&format!("1. File ownership: ls -l {}\n", file_path.display()));
-            suggestion.push_str(&format!("2. Current user: id (should show UID {})\n", current_uid));
+            suggestion.push_str(&format!(
+                "1. File ownership: ls -l {}\n",
+                file_path.display()
+            ));
+            suggestion.push_str(&format!(
+                "2. Current user: id (should show UID {})\n",
+                current_uid
+            ));
             if is_private_key {
-                suggestion.push_str(&format!("3. Fix permissions: chmod 0600 {}\n", file_path.display()));
+                suggestion.push_str(&format!(
+                    "3. Fix permissions: chmod 0600 {}\n",
+                    file_path.display()
+                ));
             }
         }
     }
@@ -365,7 +407,9 @@ fn generate_fix_suggestion(
         suggestion.push_str("2. Go to the Security tab\n");
         suggestion.push_str("3. Ensure your user account has Read permissions\n");
         if is_private_key {
-            suggestion.push_str("4. For private keys, ensure only your user has access (remove other users)\n");
+            suggestion.push_str(
+                "4. For private keys, ensure only your user has access (remove other users)\n",
+            );
         }
     }
 
@@ -414,7 +458,7 @@ mod tests {
     fn test_fix_suggestion_container_ownership() {
         let path = Path::new("/certs/server.key");
         let suggestion = generate_fix_suggestion(
-            1000, // current UID
+            1000,       // current UID
             Some(1003), // file owner UID
             Some(0o600),
             true, // in container
@@ -432,7 +476,7 @@ mod tests {
         let path = Path::new("/certs/server.key");
         let suggestion = generate_fix_suggestion(
             1000,
-            Some(1000), // same owner
+            Some(1000),  // same owner
             Some(0o644), // insecure permissions
             false,
             path,

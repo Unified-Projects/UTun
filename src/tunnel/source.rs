@@ -79,15 +79,14 @@ pub struct PortListener {
     pub listener: TcpListener,
 }
 
+#[derive(Default)]
 pub struct ListenerManager {
     listeners: Vec<PortListener>,
 }
 
 impl ListenerManager {
     pub fn new() -> Self {
-        Self {
-            listeners: Vec::new(),
-        }
+        Self::default()
     }
 
     pub async fn add_listener(
@@ -97,9 +96,9 @@ impl ListenerManager {
         protocol: Protocol,
     ) -> Result<(), SourceError> {
         let addr = format!("{}:{}", listen_ip, port);
-        let listener = TcpListener::bind(&addr).await.map_err(|e| {
-            SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
-        })?;
+        let listener = TcpListener::bind(&addr)
+            .await
+            .map_err(|e| SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e)))?;
         tracing::info!("Listening on {} (protocol: {:?})", addr, protocol);
 
         self.listeners.push(PortListener {
@@ -182,6 +181,7 @@ impl HeartbeatState {
         *self.consecutive_misses.read().await
     }
 
+    #[allow(dead_code)]
     async fn get_rtt_avg_us(&self) -> Option<u64> {
         *self.rtt_avg_us.read().await
     }
@@ -272,9 +272,7 @@ impl ReconnectionManager {
                 Ok(_) => {
                     tracing::info!("Reconnection successful after {} attempts", attempt + 1);
                     self.reset();
-                    self.health_monitor
-                        .set_status(HealthStatus::Healthy)
-                        .await;
+                    self.health_monitor.set_status(HealthStatus::Healthy).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -452,10 +450,8 @@ impl SourceContainer {
             return self.connect_to_dest_once().await;
         }
 
-        let reconnection_manager = ReconnectionManager::new(
-            self.config.clone(),
-            self.health_monitor.clone(),
-        );
+        let reconnection_manager =
+            ReconnectionManager::new(self.config.clone(), self.health_monitor.clone());
 
         reconnection_manager
             .reconnect(|| async {
@@ -726,7 +722,9 @@ impl SourceContainer {
     ) -> Result<(), SourceError> {
         tracing::info!(
             "New client connection from {} targeting port {} ({:?})",
-            addr, target_port, protocol
+            addr,
+            target_port,
+            protocol
         );
 
         let (conn, _tx_from_tunnel, mut rx_to_tunnel) = self
@@ -888,12 +886,8 @@ impl SourceContainer {
         tracing::info!("Running with {} listener(s)", listeners.len());
 
         // Create a channel for accepted connections
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
-            TcpStream,
-            SocketAddr,
-            u16,
-            Protocol,
-        )>();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(TcpStream, SocketAddr, u16, Protocol)>();
 
         // Spawn a task for each listener
         let mut listener_handles = Vec::new();

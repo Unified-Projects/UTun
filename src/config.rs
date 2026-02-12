@@ -189,7 +189,7 @@ pub enum Protocol {
 impl Protocol {
     /// Convert config Protocol to tunnel Protocol
     /// For Both, defaults to Tcp (caller should handle creating multiple listeners if needed)
-    pub fn to_tunnel_protocol(&self) -> crate::tunnel::Protocol {
+    pub fn to_tunnel_protocol(self) -> crate::tunnel::Protocol {
         match self {
             Protocol::Tcp | Protocol::Both => crate::tunnel::Protocol::Tcp,
             Protocol::Udp => crate::tunnel::Protocol::Udp,

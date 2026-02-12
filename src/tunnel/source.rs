@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -71,6 +73,233 @@ impl SourceMetrics {
     }
 }
 
+pub struct PortListener {
+    pub port: u16,
+    pub protocol: Protocol,
+    pub listener: TcpListener,
+}
+
+pub struct ListenerManager {
+    listeners: Vec<PortListener>,
+}
+
+impl ListenerManager {
+    pub fn new() -> Self {
+        Self {
+            listeners: Vec::new(),
+        }
+    }
+
+    pub async fn add_listener(
+        &mut self,
+        listen_ip: &str,
+        port: u16,
+        protocol: Protocol,
+    ) -> Result<(), SourceError> {
+        let addr = format!("{}:{}", listen_ip, port);
+        let listener = TcpListener::bind(&addr).await.map_err(|e| {
+            SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
+        })?;
+        tracing::info!("Listening on {} (protocol: {:?})", addr, protocol);
+
+        self.listeners.push(PortListener {
+            port,
+            protocol,
+            listener,
+        });
+
+        Ok(())
+    }
+
+    pub fn listeners(&self) -> &[PortListener] {
+        &self.listeners
+    }
+}
+
+/// Tracks heartbeat state for ping/pong exchanges
+struct HeartbeatState {
+    last_activity: Arc<RwLock<Instant>>,
+    last_ping_seq: Arc<RwLock<Option<u32>>>,
+    last_ping_time: Arc<RwLock<Option<Instant>>>,
+    consecutive_misses: Arc<RwLock<u8>>,
+    rtt_avg_us: Arc<RwLock<Option<u64>>>,
+}
+
+impl HeartbeatState {
+    fn new() -> Self {
+        Self {
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_ping_seq: Arc::new(RwLock::new(None)),
+            last_ping_time: Arc::new(RwLock::new(None)),
+            consecutive_misses: Arc::new(RwLock::new(0)),
+            rtt_avg_us: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    async fn record_activity(&self) {
+        *self.last_activity.write().await = Instant::now();
+    }
+
+    async fn should_send_ping(&self, interval_ms: u64) -> bool {
+        self.last_activity.read().await.elapsed() >= Duration::from_millis(interval_ms)
+    }
+
+    async fn record_ping_sent(&self, seq: u32) {
+        *self.last_ping_seq.write().await = Some(seq);
+        *self.last_ping_time.write().await = Some(Instant::now());
+        self.record_activity().await;
+    }
+
+    async fn record_pong_received(&self, seq: u32) -> Option<Duration> {
+        if *self.last_ping_seq.read().await == Some(seq) {
+            *self.consecutive_misses.write().await = 0;
+
+            if let Some(sent_time) = *self.last_ping_time.read().await {
+                let rtt = sent_time.elapsed();
+                let rtt_us = rtt.as_micros() as u64;
+
+                // Exponential moving average: new = 0.2 * current + 0.8 * old
+                let mut avg = self.rtt_avg_us.write().await;
+                *avg = Some(match *avg {
+                    Some(old) => (rtt_us * 2 + old * 8) / 10,
+                    None => rtt_us,
+                });
+
+                self.record_activity().await;
+                return Some(rtt);
+            }
+        }
+        None
+    }
+
+    async fn record_ping_timeout(&self) -> u8 {
+        let mut misses = self.consecutive_misses.write().await;
+        *misses = misses.saturating_add(1);
+        *misses
+    }
+
+    async fn get_consecutive_misses(&self) -> u8 {
+        *self.consecutive_misses.read().await
+    }
+
+    async fn get_rtt_avg_us(&self) -> Option<u64> {
+        *self.rtt_avg_us.read().await
+    }
+}
+
+/// Manages automatic reconnection with exponential backoff
+pub struct ReconnectionManager {
+    attempt: AtomicU32,
+    last_delay_ms: Arc<RwLock<u64>>,
+    config: SourceConfig,
+    health_monitor: Arc<HealthMonitor>,
+}
+
+impl ReconnectionManager {
+    pub fn new(config: SourceConfig, health_monitor: Arc<HealthMonitor>) -> Self {
+        Self {
+            attempt: AtomicU32::new(0),
+            last_delay_ms: Arc::new(RwLock::new(0)),
+            config,
+            health_monitor,
+        }
+    }
+
+    /// Calculate next backoff delay using decorrelated jitter
+    async fn calculate_backoff(&self) -> Duration {
+        let attempt = self.attempt.load(Ordering::SeqCst);
+
+        if attempt == 0 {
+            return Duration::from_millis(0); // First retry immediate
+        }
+
+        if attempt == 1 {
+            return Duration::from_millis(self.config.initial_reconnect_delay_ms);
+        }
+
+        let last = *self.last_delay_ms.read().await;
+        let base = self.config.initial_reconnect_delay_ms;
+        let max = self.config.max_reconnect_delay_ms;
+
+        // Decorrelated jitter: random_between(base, last * 3)
+        let upper = std::cmp::min(max, last * 3);
+        let delay = if upper > base {
+            use rand::Rng;
+            let mut rng = rand::rng();
+            rng.random_range(base..=upper)
+        } else {
+            base
+        };
+
+        *self.last_delay_ms.write().await = delay;
+        Duration::from_millis(delay)
+    }
+
+    /// Attempt reconnection with backoff
+    pub async fn reconnect<F, Fut>(&self, connect_fn: F) -> Result<(), SourceError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<(), SourceError>>,
+    {
+        let max_attempts = self.config.max_reconnect_attempts;
+
+        loop {
+            let attempt = self.attempt.fetch_add(1, Ordering::SeqCst);
+
+            // Check if max attempts exceeded
+            if max_attempts > 0 && attempt >= max_attempts {
+                tracing::error!("Max reconnection attempts ({}) exceeded", max_attempts);
+                self.health_monitor
+                    .set_status(HealthStatus::Unhealthy)
+                    .await;
+                return Err(SourceError::ConfigError(
+                    "Max reconnection attempts exceeded".to_string(),
+                ));
+            }
+
+            // Calculate and apply backoff
+            let delay = self.calculate_backoff().await;
+            if !delay.is_zero() {
+                tracing::info!("Reconnection attempt {} after {:?}", attempt + 1, delay);
+                self.health_monitor
+                    .set_status(HealthStatus::Connecting)
+                    .await;
+                tokio::time::sleep(delay).await;
+            }
+
+            // Attempt connection
+            match connect_fn().await {
+                Ok(_) => {
+                    tracing::info!("Reconnection successful after {} attempts", attempt + 1);
+                    self.reset();
+                    self.health_monitor
+                        .set_status(HealthStatus::Healthy)
+                        .await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("Reconnection attempt {} failed: {}", attempt + 1, e);
+                    self.health_monitor.record_error().await;
+
+                    // Circuit breaker: extended backoff after 10 failures
+                    if attempt >= 10 {
+                        tracing::warn!("Circuit breaker activated, using extended backoff");
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn reset(&self) {
+        self.attempt.store(0, Ordering::SeqCst);
+    }
+
+    pub fn get_attempt_count(&self) -> u32 {
+        self.attempt.load(Ordering::SeqCst)
+    }
+}
+
 pub struct SourceContainer {
     config: SourceConfig,
     key_manager: Arc<KeyManager>,
@@ -82,6 +311,8 @@ pub struct SourceContainer {
     health_monitor: Arc<HealthMonitor>,
     /// Maximum handshake message size (depends on KEM mode)
     max_handshake_size: u32,
+    heartbeat_state: Arc<HeartbeatState>,
+    ping_sequence: Arc<AtomicU32>,
 }
 
 impl SourceContainer {
@@ -119,20 +350,86 @@ impl SourceContainer {
             metrics: Arc::new(SourceMetrics::new()),
             health_monitor,
             max_handshake_size,
+            heartbeat_state: Arc::new(HeartbeatState::new()),
+            ping_sequence: Arc::new(AtomicU32::new(0)),
         })
     }
 
     pub async fn start(&self) -> Result<(), SourceError> {
         tracing::info!("Starting source container");
 
-        // Connect to destination
-        self.connect_to_dest().await?;
-
-        // Perform handshake
-        self.perform_handshake().await?;
+        if self.config.reconnection_enabled {
+            // Connect with reconnection (includes handshake and heartbeat)
+            self.connect_to_dest().await?;
+        } else {
+            // Original flow without reconnection
+            self.connect_to_dest().await?;
+            self.perform_handshake().await?;
+            self.spawn_heartbeat_task().await?;
+        }
 
         tracing::info!("Source container started successfully");
         Ok(())
+    }
+
+    pub async fn setup_listeners(&self) -> Result<Vec<PortListener>, SourceError> {
+        use crate::config::SourceMode;
+
+        let mut listeners = Vec::new();
+
+        match self.config.mode {
+            SourceMode::Transparent | SourceMode::Hybrid => {
+                // Create a listener for each exposed port
+                if self.config.exposed_ports.is_empty() {
+                    tracing::warn!(
+                        "No exposed_ports configured, falling back to single listener on port {}",
+                        self.config.listen_port
+                    );
+                    let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
+                    let listener = TcpListener::bind(&addr).await.map_err(|e| {
+                        SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
+                    })?;
+                    tracing::info!("Listening on {} (protocol: {:?})", addr, Protocol::Tcp);
+
+                    listeners.push(PortListener {
+                        port: self.config.listen_port,
+                        protocol: Protocol::Tcp,
+                        listener,
+                    });
+                } else {
+                    for exposed in &self.config.exposed_ports {
+                        let addr = format!("{}:{}", self.config.listen_ip, exposed.port);
+                        let listener = TcpListener::bind(&addr).await.map_err(|e| {
+                            SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
+                        })?;
+                        let protocol = exposed.protocol.to_tunnel_protocol();
+                        tracing::info!("Listening on {} (protocol: {:?})", addr, protocol);
+
+                        listeners.push(PortListener {
+                            port: exposed.port,
+                            protocol,
+                            listener,
+                        });
+                    }
+                }
+            }
+            SourceMode::Protocol => {
+                // Single entry point on listen_port
+                let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
+                let listener = TcpListener::bind(&addr).await.map_err(|e| {
+                    SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
+                })?;
+                tracing::info!("Listening on {} (protocol: {:?})", addr, Protocol::Tcp);
+
+                listeners.push(PortListener {
+                    port: self.config.listen_port,
+                    protocol: Protocol::Tcp,
+                    listener,
+                });
+            }
+        }
+
+        Ok(listeners)
     }
 
     pub async fn stop(&self) {
@@ -150,6 +447,27 @@ impl SourceContainer {
     }
 
     pub async fn connect_to_dest(&self) -> Result<(), SourceError> {
+        if !self.config.reconnection_enabled {
+            // Original single-attempt logic
+            return self.connect_to_dest_once().await;
+        }
+
+        let reconnection_manager = ReconnectionManager::new(
+            self.config.clone(),
+            self.health_monitor.clone(),
+        );
+
+        reconnection_manager
+            .reconnect(|| async {
+                self.connect_to_dest_once().await?;
+                self.perform_handshake().await?;
+                self.spawn_heartbeat_task().await?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn connect_to_dest_once(&self) -> Result<(), SourceError> {
         let dest_addr = format!("{}:{}", self.config.dest_host, self.config.dest_tunnel_port);
         tracing::info!("Connecting to destination at {}", dest_addr);
 
@@ -169,6 +487,15 @@ impl SourceContainer {
 
     pub async fn perform_handshake(&self) -> Result<(), SourceError> {
         tracing::info!("Starting handshake with destination");
+
+        // Validate certificate access before attempting to read
+        use crate::crypto::file_access::validate_file_access;
+        validate_file_access(
+            &self.config.client_cert_path,
+            &self.config.client_key_path,
+            "client",
+        )
+        .map_err(|e| SourceError::ConfigError(e.to_string()))?;
 
         // Load certificates
         let client_cert = std::fs::read(&self.config.client_cert_path)
@@ -318,21 +645,97 @@ impl SourceContainer {
         Ok(())
     }
 
+    /// Spawns background task to send periodic heartbeat pings
+    async fn spawn_heartbeat_task(&self) -> Result<(), SourceError> {
+        if !self.config.reconnection_enabled {
+            return Ok(());
+        }
+
+        let interval = Duration::from_millis(self.config.heartbeat_interval_ms);
+        let timeout_duration = Duration::from_millis(self.config.heartbeat_timeout_ms);
+        let max_missed = self.config.max_missed_pongs;
+
+        let state = self.heartbeat_state.clone();
+        let container = Arc::new(self.clone());
+        let health = self.health_monitor.clone();
+        let ping_seq = self.ping_sequence.clone();
+        let mut shutdown = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        // Only send ping if idle for interval duration
+                        if state.should_send_ping(interval.as_millis() as u64).await {
+                            let seq = ping_seq.fetch_add(1, Ordering::SeqCst);
+                            let ping = Frame::new_ping(seq);
+
+                            tracing::debug!("Sending heartbeat ping (seq={})", seq);
+
+                            match container.send_frame(ping).await {
+                                Ok(_) => {
+                                    state.record_ping_sent(seq).await;
+
+                                    // Wait for pong (processed in receive_frame)
+                                    tokio::time::sleep(timeout_duration).await;
+
+                                    // Check if pong was received
+                                    let misses = state.get_consecutive_misses().await;
+                                    if misses > 0 {
+                                        let total = state.record_ping_timeout().await;
+                                        tracing::warn!("Heartbeat timeout (seq={}), consecutive misses: {}", seq, total);
+
+                                        health.record_error().await;
+
+                                        if total >= max_missed {
+                                            tracing::error!("Heartbeat failed: {} consecutive timeouts", total);
+                                            health.set_status(HealthStatus::Unhealthy).await;
+                                            // Trigger reconnection (will be handled by reconnection manager)
+                                        } else if total >= max_missed / 2 {
+                                            health.set_status(HealthStatus::Degraded).await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to send heartbeat: {}", e);
+                                    health.record_error().await;
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        tracing::info!("Heartbeat task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     pub async fn handle_client(
         &self,
         mut stream: TcpStream,
         addr: SocketAddr,
+        target_port: u16,
+        protocol: Protocol,
     ) -> Result<(), SourceError> {
-        tracing::info!("New client connection from {}", addr);
+        tracing::info!(
+            "New client connection from {} targeting port {} ({:?})",
+            addr, target_port, protocol
+        );
 
-        // For now, use port 0 as a placeholder - this would come from config
         let (conn, _tx_from_tunnel, mut rx_to_tunnel) = self
             .connection_manager
-            .create_connection(addr, Protocol::Tcp, 0)
+            .create_connection(addr, protocol, target_port)
             .await?;
 
-        // Send CONNECT frame
-        let connect_frame = Frame::new_connect(conn.id(), 22, Protocol::Tcp); // SSH example
+        // Send CONNECT frame with actual target port
+        let connect_frame = Frame::new_connect(conn.id(), target_port, protocol);
         self.send_frame(connect_frame).await?;
 
         // Wait for CONNECT_ACK
@@ -366,6 +769,9 @@ impl SourceContainer {
                                 break;
                             }
                             Ok(n) => {
+                                // Record activity to prevent unnecessary pings
+                                self_clone.heartbeat_state.record_activity().await;
+
                                 let frame = Frame::new_data(conn_clone.id(), 0, &buf[..n]).unwrap();
                                 if let Err(e) = self_clone.send_frame(frame).await {
                                     tracing::error!("Failed to send frame: {}", e);
@@ -384,6 +790,9 @@ impl SourceContainer {
                     frame = rx_to_tunnel.recv() => {
                         match frame {
                             Some(f) => {
+                                // Record activity
+                                self_clone.heartbeat_state.record_activity().await;
+
                                 if let Err(e) = stream.write_all(f.payload()).await {
                                     tracing::error!("Failed to write to client: {}", e);
                                     break;
@@ -454,47 +863,103 @@ impl SourceContainer {
         let wire_frame = super::WireFrame::new(buf);
         let frame = codec.decode(&wire_frame)?;
 
+        // Handle Pong frames for heartbeat
+        if frame.frame_type() == FrameType::Pong {
+            let seq = frame.sequence();
+            if let Some(rtt) = self.heartbeat_state.record_pong_received(seq).await {
+                tracing::debug!("Received pong (seq={}) RTT: {:?}", seq, rtt);
+                self.health_monitor.record_success().await;
+            }
+        }
+
         Ok(frame)
     }
 
     pub async fn run(&self) -> Result<(), SourceError> {
-        let listener = TcpListener::bind(format!(
-            "{}:{}",
-            self.config.listen_ip, self.config.listen_port
-        ))
-        .await?;
-        tracing::info!(
-            "Listening on {}:{}",
-            self.config.listen_ip,
-            self.config.listen_port
-        );
+        // Setup all listeners
+        let listeners = self.setup_listeners().await?;
 
+        if listeners.is_empty() {
+            return Err(SourceError::ConfigError(
+                "No listeners configured".to_string(),
+            ));
+        }
+
+        tracing::info!("Running with {} listener(s)", listeners.len());
+
+        // Create a channel for accepted connections
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+            TcpStream,
+            SocketAddr,
+            u16,
+            Protocol,
+        )>();
+
+        // Spawn a task for each listener
+        let mut listener_handles = Vec::new();
+
+        for port_listener in listeners {
+            let port = port_listener.port;
+            let protocol = port_listener.protocol;
+            let listener = port_listener.listener;
+            let tx_clone = tx.clone();
+            let mut shutdown_rx = self.shutdown.subscribe();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        result = listener.accept() => {
+                            match result {
+                                Ok((stream, addr)) => {
+                                    if tx_clone.send((stream, addr, port, protocol)).is_err() {
+                                        tracing::error!("Failed to send accepted connection to channel");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Accept error on port {}: {}", port, e);
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
+                            tracing::debug!("Listener on port {} shutting down", port);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            listener_handles.push(handle);
+        }
+
+        // Drop the original sender so the channel closes when all listener tasks finish
+        drop(tx);
+
+        // Main loop: process accepted connections
         let mut shutdown_rx = self.shutdown.subscribe();
 
         loop {
             tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, addr)) => {
-                            self.metrics.connections_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some((stream, addr, port, protocol)) = rx.recv() => {
+                    self.metrics.connections_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                            let self_clone = self.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = self_clone.handle_client(stream, addr).await {
-                                    tracing::error!("Client handler error: {}", e);
-                                }
-                            });
+                    let self_clone = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone.handle_client(stream, addr, port, protocol).await {
+                            tracing::error!("Client handler error: {}", e);
                         }
-                        Err(e) => {
-                            tracing::error!("Accept error: {}", e);
-                        }
-                    }
+                    });
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("Shutdown signal received");
                     break;
                 }
             }
+        }
+
+        // Wait for all listener tasks to finish
+        for handle in listener_handles {
+            let _ = handle.await;
         }
 
         Ok(())
@@ -513,6 +978,8 @@ impl Clone for SourceContainer {
             metrics: self.metrics.clone(),
             health_monitor: self.health_monitor.clone(),
             max_handshake_size: self.max_handshake_size,
+            heartbeat_state: self.heartbeat_state.clone(),
+            ping_sequence: self.ping_sequence.clone(),
         }
     }
 }

@@ -358,6 +358,15 @@ impl DestContainer {
     async fn perform_server_handshake(&self, stream: &mut TcpStream) -> Result<Vec<u8>, DestError> {
         tracing::info!("Starting server-side handshake");
 
+        // Validate certificate access before attempting to read
+        use crate::crypto::file_access::validate_file_access;
+        validate_file_access(
+            &self.config.server_cert_path,
+            &self.config.server_key_path,
+            "server",
+        )
+        .map_err(|e| DestError::ConfigError(e.to_string()))?;
+
         // Load certificates
         let server_cert = std::fs::read(&self.config.server_cert_path)
             .map_err(|e| DestError::ConfigError(format!("Failed to read server cert: {}", e)))?;

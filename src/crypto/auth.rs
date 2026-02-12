@@ -42,6 +42,9 @@ pub enum AuthError {
 
     #[error("Certificate generation failed: {0}")]
     GenerationFailed(String),
+
+    #[error(transparent)]
+    FileAccess(#[from] crate::crypto::file_access::FileAccessError),
 }
 
 #[cfg(windows)]
@@ -506,8 +509,29 @@ pub fn load_cert_bundle(cert_path: &Path, key_path: &Path) -> Result<CertBundle,
     }
 
     // Read certificate and key files
-    let certificate_pem = fs::read_to_string(cert_path)?;
-    let private_key_pem = fs::read_to_string(key_path)?;
+    let certificate_pem = fs::read_to_string(cert_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            let msg = format!(
+                "Failed to read certificate: {}\n\nNote: Run with RUST_LOG=debug for detailed diagnostics",
+                e
+            );
+            AuthError::IoError(std::io::Error::new(e.kind(), msg))
+        } else {
+            AuthError::IoError(e)
+        }
+    })?;
+
+    let private_key_pem = fs::read_to_string(key_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            let msg = format!(
+                "Failed to read private key: {}\n\nNote: Run with RUST_LOG=debug for detailed diagnostics",
+                e
+            );
+            AuthError::IoError(std::io::Error::new(e.kind(), msg))
+        } else {
+            AuthError::IoError(e)
+        }
+    })?;
 
     // Parse PEM to DER
     let certificate_der = pem_rfc7468::decode_vec(certificate_pem.as_bytes())

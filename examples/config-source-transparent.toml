@@ -1,0 +1,75 @@
+# UTun Source Configuration - Transparent Multi-Port Mode
+# This configuration enables transparent port forwarding where each exposed port
+# gets its own listener that automatically forwards to the same port on the destination.
+
+[source]
+# IP address to listen on
+listen_ip = "0.0.0.0"
+
+# Legacy single-port listener (only used if exposed_ports is empty)
+listen_port = 3892
+
+# Mode: transparent (default), protocol, or hybrid
+# - transparent: Each exposed_port gets its own listener
+# - protocol: Single entry point, client specifies target port
+# - hybrid: Both transparent and protocol modes
+mode = "transparent"
+
+# Destination tunnel endpoint
+dest_host = "dest.example.com"
+dest_tunnel_port = 3892
+
+# Connection limits
+max_connections = 10000
+connection_timeout_ms = 30000
+keep_alive_interval_ms = 30000
+
+# Multi-port configuration
+# Each port listed here will have its own listener
+# Connections to source:PORT will be forwarded to destination:PORT
+
+[[source.exposed_ports]]
+port = 3892
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 8300
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 8121
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 8732
+protocol = "tcp"
+
+# Optional: Restrict outbound connections (empty = deny all)
+[source.allowed_outbound]
+allowed_ips = []
+
+# Authentication configuration
+[auth]
+use_mtls = true
+ca_cert_path = "certs/ca.pem"
+client_cert_path = "certs/client.pem"
+client_key_path = "certs/client-key.pem"
+verify_client_cert = true
+
+# Post-quantum cryptography settings
+[crypto]
+kem_mode = "hybrid"  # Options: hybrid, mlkem768, mceliece460896
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+# Logging configuration
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+# Metrics configuration
+[metrics]
+enabled = true
+metrics_port = 9090
+metrics_bind_ip = "127.0.0.1"

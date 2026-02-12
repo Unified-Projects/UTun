@@ -33,6 +33,9 @@ pub struct HealthCheckResult {
     pub error_count: u64,
     pub tunnel_established: bool,
     pub message: String,
+    pub consecutive_missed_pongs: Option<u8>,
+    pub average_rtt_us: Option<u64>,
+    pub reconnection_attempts: Option<u32>,
 }
 
 pub struct HealthMonitor {
@@ -41,6 +44,9 @@ pub struct HealthMonitor {
     last_success: Arc<RwLock<Option<Instant>>>,
     error_count: AtomicU64,
     tunnel_established: AtomicBool,
+    consecutive_missed_pongs: Arc<RwLock<Option<u8>>>,
+    average_rtt_us: Arc<RwLock<Option<u64>>>,
+    reconnection_attempts: Arc<RwLock<Option<u32>>>,
 }
 
 impl HealthMonitor {
@@ -51,6 +57,9 @@ impl HealthMonitor {
             last_success: Arc::new(RwLock::new(None)),
             error_count: AtomicU64::new(0),
             tunnel_established: AtomicBool::new(false),
+            consecutive_missed_pongs: Arc::new(RwLock::new(None)),
+            average_rtt_us: Arc::new(RwLock::new(None)),
+            reconnection_attempts: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -100,6 +109,21 @@ impl HealthMonitor {
         }
     }
 
+    /// Set consecutive missed pongs
+    pub async fn set_consecutive_missed_pongs(&self, count: u8) {
+        *self.consecutive_missed_pongs.write().await = Some(count);
+    }
+
+    /// Set average RTT in microseconds
+    pub async fn set_average_rtt_us(&self, rtt_us: u64) {
+        *self.average_rtt_us.write().await = Some(rtt_us);
+    }
+
+    /// Set reconnection attempts
+    pub async fn set_reconnection_attempts(&self, attempts: u32) {
+        *self.reconnection_attempts.write().await = Some(attempts);
+    }
+
     /// Get comprehensive health check result
     pub async fn check_health(&self) -> HealthCheckResult {
         let status = self.status().await;
@@ -111,6 +135,10 @@ impl HealthMonitor {
             let last = self.last_success.read().await;
             last.map(|t| t.elapsed().as_secs())
         };
+
+        let consecutive_missed_pongs = *self.consecutive_missed_pongs.read().await;
+        let average_rtt_us = *self.average_rtt_us.read().await;
+        let reconnection_attempts = *self.reconnection_attempts.read().await;
 
         let message = match status {
             HealthStatus::Starting => "Service is starting up".to_string(),
@@ -127,6 +155,9 @@ impl HealthMonitor {
             error_count,
             tunnel_established,
             message,
+            consecutive_missed_pongs,
+            average_rtt_us,
+            reconnection_attempts,
         }
     }
 
@@ -203,6 +234,9 @@ impl Clone for HealthMonitor {
             last_success: self.last_success.clone(),
             error_count: AtomicU64::new(self.error_count.load(Ordering::Relaxed)),
             tunnel_established: AtomicBool::new(self.tunnel_established.load(Ordering::Relaxed)),
+            consecutive_missed_pongs: self.consecutive_missed_pongs.clone(),
+            average_rtt_us: self.average_rtt_us.clone(),
+            reconnection_attempts: self.reconnection_attempts.clone(),
         }
     }
 }

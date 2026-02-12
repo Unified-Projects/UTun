@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod file_access;
 pub mod hybrid_kem;
 pub mod key_manager;
 pub mod symmetric;

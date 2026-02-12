@@ -35,6 +35,9 @@ pub struct SourceConfig {
     #[serde(default = "default_source_port")]
     pub listen_port: u16,
 
+    #[serde(default)]
+    pub mode: SourceMode,
+
     pub dest_host: String,
     pub dest_tunnel_port: u16,
 
@@ -46,6 +49,32 @@ pub struct SourceConfig {
 
     #[serde(default = "default_keep_alive")]
     pub keep_alive_interval_ms: u64,
+
+    // Heartbeat configuration
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_ms: u64,
+
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout_ms: u64,
+
+    #[serde(default = "default_max_missed_pongs")]
+    pub max_missed_pongs: u8,
+
+    // Reconnection configuration
+    #[serde(default = "default_reconnection_enabled")]
+    pub reconnection_enabled: bool,
+
+    #[serde(default = "default_max_reconnect_attempts")]
+    pub max_reconnect_attempts: u32, // 0 = infinite
+
+    #[serde(default = "default_initial_reconnect_delay")]
+    pub initial_reconnect_delay_ms: u64,
+
+    #[serde(default = "default_max_reconnect_delay")]
+    pub max_reconnect_delay_ms: u64,
+
+    #[serde(default = "default_frame_buffer_size")]
+    pub frame_buffer_size: usize,
 
     #[serde(default)]
     pub allowed_outbound: AllowedOutboundConfig,
@@ -155,6 +184,31 @@ pub enum Protocol {
     Tcp,
     Udp,
     Both,
+}
+
+impl Protocol {
+    /// Convert config Protocol to tunnel Protocol
+    /// For Both, defaults to Tcp (caller should handle creating multiple listeners if needed)
+    pub fn to_tunnel_protocol(&self) -> crate::tunnel::Protocol {
+        match self {
+            Protocol::Tcp | Protocol::Both => crate::tunnel::Protocol::Tcp,
+            Protocol::Udp => crate::tunnel::Protocol::Udp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceMode {
+    Transparent,
+    Protocol,
+    Hybrid,
+}
+
+impl Default for SourceMode {
+    fn default() -> Self {
+        SourceMode::Transparent
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -285,6 +339,34 @@ fn default_metrics_bind() -> String {
     "127.0.0.1".to_string()
 } // Bind to localhost only for security
 
+// Heartbeat defaults
+fn default_heartbeat_interval() -> u64 {
+    15000
+}
+fn default_heartbeat_timeout() -> u64 {
+    5000
+}
+fn default_max_missed_pongs() -> u8 {
+    3
+}
+
+// Reconnection defaults
+fn default_reconnection_enabled() -> bool {
+    true
+}
+fn default_max_reconnect_attempts() -> u32 {
+    0
+} // 0 = infinite
+fn default_initial_reconnect_delay() -> u64 {
+    1000
+}
+fn default_max_reconnect_delay() -> u64 {
+    60000
+}
+fn default_frame_buffer_size() -> usize {
+    1000
+}
+
 /// Load configuration from file
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let content = fs::read_to_string(path)?;
@@ -315,6 +397,35 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
             ip.parse::<IpNetwork>().map_err(|e| {
                 ConfigError::ValidationError(format!("Invalid IP range '{}': {}", ip, e))
             })?;
+        }
+
+        // Validate exposed_ports
+        let mut seen_ports = std::collections::HashSet::new();
+        for exposed in &source.exposed_ports {
+            if !seen_ports.insert(exposed.port) {
+                return Err(ConfigError::ValidationError(format!(
+                    "Duplicate port {} in exposed_ports",
+                    exposed.port
+                )));
+            }
+        }
+
+        // Validate mode requirements
+        match source.mode {
+            SourceMode::Transparent | SourceMode::Hybrid => {
+                if source.exposed_ports.is_empty() {
+                    return Err(ConfigError::ValidationError(
+                        "Transparent/Hybrid mode requires at least one exposed_port".to_string()
+                    ));
+                }
+            }
+            SourceMode::Protocol => {
+                if source.exposed_ports.is_empty() {
+                    tracing::warn!(
+                        "Protocol mode without exposed_ports - no port restrictions will be enforced"
+                    );
+                }
+            }
         }
     }
 

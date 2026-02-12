@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-02-12
+
+### Added
+- Transparent multi-port forwarding mode for source containers. Each port in
+  `exposed_ports` now gets its own listener that automatically forwards
+  connections to the same port on the destination server. This replaces the
+  previous single-port limitation where all traffic went through one port.
+- New `mode` configuration option for source containers with three modes:
+  `transparent` (default, multi-port), `protocol` (single entry point), and
+  `hybrid` (both modes).
+- Port validation to prevent duplicate ports in `exposed_ports` configuration.
+- Example configuration file `examples/config-source-transparent.toml` showing
+  multi-port setup.
+
+### Fixed
+- Source mode now uses actual target port in CONNECT frames instead of
+  hardcoded port 22. Each connection now correctly specifies which destination
+  port to connect to.
+- Updated `bytes` dependency from 1.11.0 to 1.11.1 to fix integer overflow
+  vulnerability (RUSTSEC-2026-0007).
+- Updated `time` dependency from 0.3.46 to 0.3.47 to fix denial of service
+  vulnerability via stack exhaustion (RUSTSEC-2026-0009).
+- Improved error messages for certificate file access issues with better
+  diagnostics and fix suggestions.
+
+### Changed
+- Source container now spawns separate listener tasks for each exposed port,
+  using channel-based communication for centralized connection handling.
+- Added graceful shutdown for all listener tasks.
+
 ## [0.1.2] - 2026-02-02
 
 ### Fixed

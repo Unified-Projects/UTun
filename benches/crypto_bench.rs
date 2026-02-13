@@ -88,16 +88,6 @@ fn benchmark_public_key_serialization(c: &mut Criterion) {
     });
 }
 
-fn benchmark_counter_mode_encryption(c: &mut Criterion) {
-    let key = [0u8; 32];
-    let crypto = SymmetricCrypto::new(&key);
-    let plaintext = vec![0u8; 1024];
-
-    c.bench_function("aes_gcm_counter_mode", |b| {
-        b.iter(|| crypto.encrypt_with_counter(&plaintext, 0))
-    });
-}
-
 fn benchmark_large_payload(c: &mut Criterion) {
     let key = [0u8; 32];
     let crypto = SymmetricCrypto::new(&key);
@@ -137,7 +127,6 @@ criterion_group!(
     benchmark_aes_gcm,
     benchmark_full_handshake,
     benchmark_public_key_serialization,
-    benchmark_counter_mode_encryption,
     benchmark_large_payload,
 );
 

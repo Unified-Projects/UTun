@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, RwLock};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 // Maximum frame size to prevent memory exhaustion (1MB)
@@ -96,13 +98,18 @@ impl ListenerManager {
         protocol: Protocol,
     ) -> Result<(), SourceError> {
         let addr = format!("{}:{}", listen_ip, port);
-        let listener = TcpListener::bind(&addr)
+        let (listener, actual_port) = bind_with_reuse(&addr)
             .await
             .map_err(|e| SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e)))?;
-        tracing::info!("Listening on {} (protocol: {:?})", addr, protocol);
+        tracing::info!(
+            "Listening on {}:{} (protocol: {:?})",
+            listen_ip,
+            actual_port,
+            protocol
+        );
 
         self.listeners.push(PortListener {
-            port,
+            port: actual_port,
             protocol,
             listener,
         });
@@ -303,7 +310,9 @@ pub struct SourceContainer {
     key_manager: Arc<KeyManager>,
     connection_manager: Arc<ConnectionManager>,
     frame_codec: Arc<RwLock<Option<Arc<FrameCodec>>>>,
-    tunnel_stream: Arc<RwLock<Option<TcpStream>>>,
+    tunnel_stream: Arc<RwLock<Option<TcpStream>>>, // Used only during handshake
+    tunnel_read: Arc<Mutex<Option<OwnedReadHalf>>>, // For demux task
+    tunnel_write: Arc<Mutex<Option<OwnedWriteHalf>>>, // For sending frames
     shutdown: watch::Sender<bool>,
     metrics: Arc<SourceMetrics>,
     health_monitor: Arc<HealthMonitor>,
@@ -311,6 +320,74 @@ pub struct SourceContainer {
     max_handshake_size: u32,
     heartbeat_state: Arc<HeartbeatState>,
     ping_sequence: Arc<AtomicU32>,
+    /// Registry mapping connection_id to tx_from_tunnel for frame demultiplexing
+    connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>>,
+}
+
+/// Helper function to create TcpListener with SO_REUSEADDR and SO_REUSEPORT enabled
+/// If bind fails, retries with up to 5 incremented ports
+/// Returns (TcpListener, actual_port_bound)
+async fn bind_with_reuse(addr: &str) -> std::io::Result<(TcpListener, u16)> {
+    let mut socket_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let original_port = socket_addr.port();
+    let mut last_error = None;
+
+    // Try original port + up to 5 fallback ports
+    for attempt in 0..6 {
+        let current_port = original_port + attempt;
+
+        match socket_addr {
+            SocketAddr::V4(ref mut addr) => addr.set_port(current_port),
+            SocketAddr::V6(ref mut addr) => addr.set_port(current_port),
+        }
+
+        if attempt > 0 {
+            tracing::warn!(
+                "Port {} in use, trying fallback port {}",
+                original_port,
+                current_port
+            );
+        }
+
+        let socket = match socket_addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+
+        socket.set_reuseaddr(true)?;
+        #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+        socket.set_reuseport(true)?;
+
+        match socket.bind(socket_addr) {
+            Ok(_) => {
+                if attempt > 0 {
+                    tracing::warn!(
+                        "Bound to fallback port {} instead of configured {}",
+                        current_port,
+                        original_port
+                    );
+                }
+                let listener = socket.listen(1024)?;
+                return Ok((listener, current_port));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_error = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // All attempts failed
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "All fallback ports exhausted",
+        )
+    }))
 }
 
 impl SourceContainer {
@@ -331,12 +408,6 @@ impl SourceContainer {
         health_monitor.set_status(HealthStatus::Starting).await;
 
         let max_handshake_size = crypto_config.effective_max_handshake_size();
-        tracing::info!(
-            "Using max handshake size: {} bytes ({} KB) for KEM mode {:?}",
-            max_handshake_size,
-            max_handshake_size / 1024,
-            crypto_config.kem_mode
-        );
 
         Ok(Self {
             config,
@@ -344,18 +415,19 @@ impl SourceContainer {
             connection_manager,
             frame_codec: Arc::new(RwLock::new(None)),
             tunnel_stream: Arc::new(RwLock::new(None)),
+            tunnel_read: Arc::new(Mutex::new(None)),
+            tunnel_write: Arc::new(Mutex::new(None)),
             shutdown: shutdown_tx,
             metrics: Arc::new(SourceMetrics::new()),
             health_monitor,
             max_handshake_size,
             heartbeat_state: Arc::new(HeartbeatState::new()),
             ping_sequence: Arc::new(AtomicU32::new(0)),
+            connection_registry: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub async fn start(&self) -> Result<(), SourceError> {
-        tracing::info!("Starting source container");
-
         if self.config.reconnection_enabled {
             // Connect with reconnection (includes handshake and heartbeat)
             self.connect_to_dest().await?;
@@ -366,7 +438,6 @@ impl SourceContainer {
             self.spawn_heartbeat_task().await?;
         }
 
-        tracing::info!("Source container started successfully");
         Ok(())
     }
 
@@ -384,27 +455,41 @@ impl SourceContainer {
                         self.config.listen_port
                     );
                     let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
-                    let listener = TcpListener::bind(&addr).await.map_err(|e| {
+                    let (listener, actual_port) = bind_with_reuse(&addr).await.map_err(|e| {
                         SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
                     })?;
-                    tracing::info!("Listening on {} (protocol: {:?})", addr, Protocol::Tcp);
+                    tracing::info!(
+                        "Listening on {}:{} (protocol: {:?})",
+                        self.config.listen_ip,
+                        actual_port,
+                        Protocol::Tcp
+                    );
 
                     listeners.push(PortListener {
-                        port: self.config.listen_port,
+                        port: actual_port,
                         protocol: Protocol::Tcp,
                         listener,
                     });
                 } else {
                     for exposed in &self.config.exposed_ports {
                         let addr = format!("{}:{}", self.config.listen_ip, exposed.port);
-                        let listener = TcpListener::bind(&addr).await.map_err(|e| {
-                            SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
-                        })?;
+                        let (listener, actual_port) =
+                            bind_with_reuse(&addr).await.map_err(|e| {
+                                SourceError::ConfigError(format!(
+                                    "Failed to bind to {}: {}",
+                                    addr, e
+                                ))
+                            })?;
                         let protocol = exposed.protocol.to_tunnel_protocol();
-                        tracing::info!("Listening on {} (protocol: {:?})", addr, protocol);
+                        tracing::info!(
+                            "Listening on {}:{} (protocol: {:?})",
+                            self.config.listen_ip,
+                            actual_port,
+                            protocol
+                        );
 
                         listeners.push(PortListener {
-                            port: exposed.port,
+                            port: actual_port,
                             protocol,
                             listener,
                         });
@@ -414,13 +499,18 @@ impl SourceContainer {
             SourceMode::Protocol => {
                 // Single entry point on listen_port
                 let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
-                let listener = TcpListener::bind(&addr).await.map_err(|e| {
+                let (listener, actual_port) = bind_with_reuse(&addr).await.map_err(|e| {
                     SourceError::ConfigError(format!("Failed to bind to {}: {}", addr, e))
                 })?;
-                tracing::info!("Listening on {} (protocol: {:?})", addr, Protocol::Tcp);
+                tracing::info!(
+                    "Listening on {}:{} (protocol: {:?})",
+                    self.config.listen_ip,
+                    actual_port,
+                    Protocol::Tcp
+                );
 
                 listeners.push(PortListener {
-                    port: self.config.listen_port,
+                    port: actual_port,
                     protocol: Protocol::Tcp,
                     listener,
                 });
@@ -465,7 +555,6 @@ impl SourceContainer {
 
     async fn connect_to_dest_once(&self) -> Result<(), SourceError> {
         let dest_addr = format!("{}:{}", self.config.dest_host, self.config.dest_tunnel_port);
-        tracing::info!("Connecting to destination at {}", dest_addr);
 
         // Set status to Connecting
         self.health_monitor
@@ -473,7 +562,6 @@ impl SourceContainer {
             .await;
 
         let stream = TcpStream::connect(&dest_addr).await?;
-        tracing::info!("Connected to destination");
 
         let mut tunnel_stream = self.tunnel_stream.write().await;
         *tunnel_stream = Some(stream);
@@ -482,8 +570,6 @@ impl SourceContainer {
     }
 
     pub async fn perform_handshake(&self) -> Result<(), SourceError> {
-        tracing::info!("Starting handshake with destination");
-
         // Validate certificate access before attempting to read
         use crate::crypto::file_access::validate_file_access;
         validate_file_access(
@@ -637,8 +723,140 @@ impl SourceContainer {
         self.health_monitor.set_status(HealthStatus::Healthy).await;
         self.health_monitor.record_success().await;
 
-        tracing::info!("Handshake completed successfully");
+        // Split tunnel stream into read/write halves to avoid lock contention
+        {
+            let mut tunnel_stream_guard = self.tunnel_stream.write().await;
+            if let Some(stream) = tunnel_stream_guard.take() {
+                let (read_half, write_half) = stream.into_split();
+
+                let mut tunnel_read = self.tunnel_read.lock().await;
+                *tunnel_read = Some(read_half);
+
+                let mut tunnel_write = self.tunnel_write.lock().await;
+                *tunnel_write = Some(write_half);
+            }
+        }
+
+        // Spawn demux task after handshake completes
+        self.spawn_demux_task();
+
         Ok(())
+    }
+
+    /// Spawns background task to demultiplex incoming frames to the correct connection handlers
+    fn spawn_demux_task(&self) {
+        let registry = self.connection_registry.clone();
+        let frame_codec = self.frame_codec.clone();
+        let tunnel_read = self.tunnel_read.clone();
+        let heartbeat_state = self.heartbeat_state.clone();
+        let health_monitor = self.health_monitor.clone();
+        let mut shutdown = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        break;
+                    }
+                    frame_result = Self::read_frame_static(&frame_codec, &tunnel_read, &heartbeat_state, &health_monitor) => {
+                        match frame_result {
+                            Ok(frame) => {
+                                let frame_type = frame.frame_type();
+                                let conn_id = frame.connection_id();
+
+                                match frame_type {
+                                    FrameType::Data | FrameType::ConnectAck => {
+                                        // Route to connection by connection_id
+                                        let registry_read = registry.read().await;
+
+                                        if let Some(tx) = registry_read.get(&conn_id) {
+                                            if tx.send(frame).await.is_err() {
+                                                tracing::error!("Connection {} channel closed, failed to route frame", conn_id);
+                                                // Connection dropped, will be unregistered by handle_client cleanup
+                                            }
+                                        } else {
+                                            tracing::warn!("Frame for unknown connection: {}", conn_id);
+                                        }
+                                    }
+                                    FrameType::Pong => {
+                                        // Already handled in read_frame_static
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Demux failed to read frame: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Static version of receive_frame for use in demux task
+    async fn read_frame_static(
+        frame_codec: &Arc<RwLock<Option<Arc<FrameCodec>>>>,
+        tunnel_read: &Arc<Mutex<Option<OwnedReadHalf>>>,
+        heartbeat_state: &Arc<HeartbeatState>,
+        health_monitor: &Arc<HealthMonitor>,
+    ) -> Result<Frame, SourceError> {
+        let mut tunnel_read_guard = tunnel_read.lock().await;
+        let stream = tunnel_read_guard
+            .as_mut()
+            .ok_or(SourceError::NotConnected)?;
+
+        // Read frame length with timeout
+        let len = match timeout(FRAME_READ_TIMEOUT, stream.read_u32()).await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => return Err(SourceError::IoError(e)),
+            Err(_) => return Err(SourceError::Timeout),
+        };
+
+        // Validate frame size before allocation
+        if len > MAX_FRAME_SIZE {
+            return Err(SourceError::FrameTooLarge {
+                size: len,
+                max: MAX_FRAME_SIZE,
+            });
+        }
+
+        let mut buf = vec![0u8; len as usize];
+        match timeout(FRAME_READ_TIMEOUT, stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(SourceError::IoError(e)),
+            Err(_) => return Err(SourceError::Timeout),
+        }
+
+        let codec_guard = frame_codec.read().await;
+        let codec = codec_guard.as_ref().ok_or(SourceError::NotConnected)?;
+
+        let wire_frame = super::WireFrame::new(buf);
+        let frame = codec.decode(&wire_frame)?;
+
+        // Handle Pong frames for heartbeat
+        if frame.frame_type() == FrameType::Pong {
+            let seq = frame.sequence();
+            if let Some(rtt) = heartbeat_state.record_pong_received(seq).await {
+                tracing::debug!("Received pong (seq={}) RTT: {:?}", seq, rtt);
+                health_monitor.record_success().await;
+            }
+        }
+
+        Ok(frame)
+    }
+
+    /// Register a connection for frame demultiplexing
+    async fn register_connection(&self, id: u32, tx: mpsc::Sender<Frame>) {
+        let mut registry = self.connection_registry.write().await;
+        registry.insert(id, tx);
+    }
+
+    /// Unregister a connection from frame demultiplexing
+    async fn unregister_connection(&self, id: u32) {
+        let mut registry = self.connection_registry.write().await;
+        registry.remove(&id);
     }
 
     /// Spawns background task to send periodic heartbeat pings
@@ -720,29 +938,60 @@ impl SourceContainer {
         target_port: u16,
         protocol: Protocol,
     ) -> Result<(), SourceError> {
-        tracing::info!(
-            "New client connection from {} targeting port {} ({:?})",
-            addr,
-            target_port,
-            protocol
-        );
-
-        let (conn, _tx_from_tunnel, mut rx_to_tunnel) = self
+        let (conn, tx_from_tunnel, _rx_to_tunnel) = self
             .connection_manager
             .create_connection(addr, protocol, target_port)
             .await?;
 
+        let conn_id = conn.id();
+
+        // Register connection for demux routing
+        self.register_connection(conn_id, tx_from_tunnel).await;
+
+        // Extract rx_from_tunnel to receive frames routed by demux
+        let mut rx_from_tunnel = {
+            let mut rx_guard = conn.rx_from_tunnel.write().await;
+            rx_guard.take().ok_or(SourceError::ConfigError(
+                "rx_from_tunnel already taken".to_string(),
+            ))?
+        };
+
         // Send CONNECT frame with actual target port
-        let connect_frame = Frame::new_connect(conn.id(), target_port, protocol);
+        let connect_frame = Frame::new_connect(conn_id, target_port, protocol);
         self.send_frame(connect_frame).await?;
 
-        // Wait for CONNECT_ACK
-        let ack_frame = self.receive_frame().await?;
+        // Wait for CONNECT_ACK with timeout (handles early client disconnect)
+        let ack_frame =
+            match tokio::time::timeout(Duration::from_secs(5), rx_from_tunnel.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    tracing::error!(
+                        "Connection {} channel closed while waiting for CONNECT_ACK",
+                        conn_id
+                    );
+                    self.unregister_connection(conn_id).await;
+                    return Err(SourceError::ConfigError(
+                        "Channel closed while waiting for CONNECT_ACK".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    // Timeout - likely client disconnected or destination issue
+                    tracing::debug!("Connection {} timeout waiting for CONNECT_ACK", conn_id);
+                    let mut fin_frame = Frame::new_data(conn_id, 0, &[]).unwrap();
+                    fin_frame.set_fin();
+                    let _ = self.send_frame(fin_frame).await;
+                    self.unregister_connection(conn_id).await;
+                    return Ok(()); // Clean exit
+                }
+            };
+
         if ack_frame.frame_type() != FrameType::ConnectAck {
+            self.unregister_connection(conn_id).await;
             return Err(SourceError::ConfigError("Expected CONNECT_ACK".to_string()));
         }
 
         if ack_frame.payload().is_empty() || ack_frame.payload()[0] == 0 {
+            self.unregister_connection(conn_id).await;
             return Err(SourceError::ConfigError("Connection rejected".to_string()));
         }
 
@@ -785,7 +1034,7 @@ impl SourceContainer {
                     }
 
                     // Receive from tunnel, write to client
-                    frame = rx_to_tunnel.recv() => {
+                    frame = rx_from_tunnel.recv() => {
                         match frame {
                             Some(f) => {
                                 // Record activity
@@ -807,6 +1056,8 @@ impl SourceContainer {
                 }
             }
 
+            // Cleanup: unregister connection from demux registry
+            self_clone.unregister_connection(conn_clone.id()).await;
             conn_clone.set_state(super::ConnectionState::Closed).await;
         });
 
@@ -819,8 +1070,10 @@ impl SourceContainer {
 
         let wire_frame = codec.encode(&frame)?;
 
-        let mut tunnel_stream = self.tunnel_stream.write().await;
-        let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
+        let mut tunnel_write_guard = self.tunnel_write.lock().await;
+        let stream = tunnel_write_guard
+            .as_mut()
+            .ok_or(SourceError::NotConnected)?;
 
         stream.write_u32(wire_frame.len() as u32).await?;
         stream.write_all(wire_frame.as_bytes()).await?;
@@ -968,12 +1221,15 @@ impl Clone for SourceContainer {
             connection_manager: self.connection_manager.clone(),
             frame_codec: self.frame_codec.clone(),
             tunnel_stream: self.tunnel_stream.clone(),
+            tunnel_read: self.tunnel_read.clone(),
+            tunnel_write: self.tunnel_write.clone(),
             shutdown: self.shutdown.clone(),
             metrics: self.metrics.clone(),
             health_monitor: self.health_monitor.clone(),
             max_handshake_size: self.max_handshake_size,
             heartbeat_state: self.heartbeat_state.clone(),
             ping_sequence: self.ping_sequence.clone(),
+            connection_registry: self.connection_registry.clone(),
         }
     }
 }

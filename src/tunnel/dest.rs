@@ -136,12 +136,6 @@ impl DestContainer {
         health_monitor.set_status(HealthStatus::Starting).await;
 
         let max_handshake_size = crypto_config.effective_max_handshake_size();
-        tracing::info!(
-            "Using max handshake size: {} bytes ({} KB) for KEM mode {:?}",
-            max_handshake_size,
-            max_handshake_size / 1024,
-            crypto_config.kem_mode
-        );
 
         Ok(Self {
             config,
@@ -159,12 +153,10 @@ impl DestContainer {
     }
 
     pub async fn start(&self) -> Result<(), DestError> {
-        tracing::info!("Starting destination container");
         // Set status to Connecting as we wait for source to connect
         self.health_monitor
             .set_status(HealthStatus::Connecting)
             .await;
-        tracing::info!("Destination container started successfully");
         Ok(())
     }
 
@@ -209,7 +201,7 @@ impl DestContainer {
         hkdf.expand(b"authentication", &mut mac_key)
             .map_err(|_| DestError::ConfigError("Key derivation failed".to_string()))?;
 
-        let derived_key = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+        let derived_key = DerivedKeyMaterial::from_parts(&mac_key, &enc_key);
 
         let session_crypto = SessionCrypto::from_key_material(&derived_key);
         let frame_codec = Arc::new(FrameCodec::new(Arc::new(session_crypto)));
@@ -351,13 +343,10 @@ impl DestContainer {
             connections.clear();
         }
 
-        tracing::info!("Tunnel connection from {} closed", addr);
         Ok(())
     }
 
     async fn perform_server_handshake(&self, stream: &mut TcpStream) -> Result<Vec<u8>, DestError> {
-        tracing::info!("Starting server-side handshake");
-
         // Validate certificate access before attempting to read
         use crate::crypto::file_access::validate_file_access;
         validate_file_access(
@@ -462,7 +451,6 @@ impl DestContainer {
         self.health_monitor.set_status(HealthStatus::Healthy).await;
         self.health_monitor.record_success().await;
 
-        tracing::info!("Server-side handshake completed successfully");
         Ok(session_key)
     }
 
@@ -494,13 +482,6 @@ impl DestContainer {
                         return Some(Frame::new_connect_ack(connection_id, false));
                     }
                 };
-
-                tracing::info!(
-                    "Connecting to service {} ({}:{})",
-                    service.name,
-                    service.target_ip,
-                    service.target_port
-                );
 
                 // Connect to target
                 let target_addr = format!("{}:{}", service.target_ip, service.target_port);
@@ -559,9 +540,7 @@ impl DestContainer {
                     loop {
                         match target_read.read(&mut buf).await {
                             Ok(0) => {
-                                // Target closed connection
-                                tracing::debug!("Target connection {} closed", connection_id);
-                                // Send FIN frame
+                                // Target closed connection, send FIN frame
                                 if let Ok(mut close_frame) = Frame::new_data(connection_id, 0, &[])
                                 {
                                     close_frame.set_fin();

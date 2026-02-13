@@ -190,25 +190,6 @@ mod symmetric_tests {
     }
 
     #[test]
-    fn test_counter_mode_encryption() {
-        let key = [0u8; 32];
-        let crypto = SymmetricCrypto::new(&key);
-
-        let plaintext = b"Counter mode test";
-
-        // Encrypt with counters
-        let ct1 = crypto.encrypt_with_counter(plaintext, 0).unwrap();
-        let ct2 = crypto.encrypt_with_counter(plaintext, 1).unwrap();
-
-        // Same counter produces same output
-        let ct1_again = crypto.encrypt_with_counter(plaintext, 0).unwrap();
-        assert_eq!(ct1, ct1_again);
-
-        // Different counters produce different output
-        assert_ne!(ct1, ct2);
-    }
-
-    #[test]
     fn test_session_crypto_roundtrip() {
         let mut enc_key = [0u8; 32];
         let mut mac_key = [0u8; 32];

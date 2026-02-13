@@ -57,13 +57,10 @@ impl SymmetricCrypto {
     }
 
     /// Generate a counter-based nonce: [4-byte session prefix][8-byte counter]
-    /// This is safe for GCM as long as the session prefix is unique per key
-    /// and the counter doesn't overflow (2^64 messages per session is plenty).
     fn generate_nonce(&self) -> Result<[u8; 12], SymmetricError> {
         // Use fetch_add to atomically increment and get the previous value
         let counter = self.nonce_counter.fetch_add(1, Ordering::SeqCst);
 
-        // Check for overflow (extremely unlikely but safety first)
         if counter == u64::MAX {
             return Err(SymmetricError::NonceCounterOverflow);
         }
@@ -72,12 +69,6 @@ impl SymmetricCrypto {
         nonce[0..4].copy_from_slice(&self.session_prefix);
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         Ok(nonce)
-    }
-
-    fn nonce_from_counter(counter: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-        nonce
     }
 
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SymmetricError> {
@@ -97,46 +88,6 @@ impl SymmetricCrypto {
     }
 
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, SymmetricError> {
-        if data.len() < 12 + 16 {
-            return Err(SymmetricError::InvalidCiphertextLength);
-        }
-
-        let nonce = Nonce::from_slice(&data[0..12]);
-        let ciphertext = &data[12..];
-
-        let plaintext = self
-            .cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| SymmetricError::DecryptionFailed)?;
-
-        Ok(plaintext)
-    }
-
-    pub fn encrypt_with_counter(
-        &self,
-        plaintext: &[u8],
-        counter: u64,
-    ) -> Result<Vec<u8>, SymmetricError> {
-        let nonce_bytes = Self::nonce_from_counter(counter);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|_| SymmetricError::EncryptionFailed)?;
-
-        let mut output = Vec::with_capacity(12 + ciphertext.len());
-        output.extend_from_slice(&nonce_bytes);
-        output.extend_from_slice(&ciphertext);
-
-        Ok(output)
-    }
-
-    pub fn decrypt_with_counter(
-        &self,
-        data: &[u8],
-        _counter: u64,
-    ) -> Result<Vec<u8>, SymmetricError> {
         if data.len() < 12 + 16 {
             return Err(SymmetricError::InvalidCiphertextLength);
         }
@@ -181,11 +132,6 @@ impl EncryptedFrame {
 }
 
 /// Maximum number of seen nonces to track for replay detection.
-///
-/// This should be large enough to cover the expected reordering window in
-/// the network path. For most applications, 100,000 provides ample margin.
-/// At 1 million packets/second, this covers 100ms of traffic.
-///
 const MAX_SEEN_NONCES: usize = 100_000;
 
 pub struct SessionCrypto {
@@ -200,8 +146,6 @@ pub struct SessionCrypto {
 impl SessionCrypto {
     pub fn from_key_material(key_material: &DerivedKeyMaterial) -> Self {
         let (enc_key, dec_key) = key_material.split();
-        // Use expose_secret() to access the underlying key bytes
-        // The wrapper types will zeroize memory when they go out of scope
         let encryptor = SymmetricCrypto::new(enc_key.expose_secret());
         let decryptor = SymmetricCrypto::new(dec_key.expose_secret());
 
@@ -217,8 +161,8 @@ impl SessionCrypto {
     }
 
     pub fn encrypt_outbound(&self, plaintext: &[u8]) -> Result<EncryptedFrame, SymmetricError> {
-        let seq = self.outbound_seq.fetch_add(1, Ordering::SeqCst);
-        let nonce_bytes = SymmetricCrypto::nonce_from_counter(seq);
+        // Use the encryptor's generate_nonce() to get proper session prefix + counter
+        let nonce_bytes = self.encryptor.generate_nonce()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self
@@ -226,6 +170,9 @@ impl SessionCrypto {
             .cipher
             .encrypt(nonce, plaintext)
             .map_err(|_| SymmetricError::EncryptionFailed)?;
+
+        // Maintain outbound_seq for monitoring/metrics
+        self.outbound_seq.fetch_add(1, Ordering::SeqCst);
 
         Ok(EncryptedFrame {
             nonce: nonce_bytes,
@@ -240,30 +187,29 @@ impl SessionCrypto {
                 tracing::warn!("Nonce reuse detected - potential replay attack");
                 return Err(SymmetricError::NonceReuse);
             }
-            // Reserve the nonce slot atomically with the check
             seen.put(frame.nonce, ());
         }
 
         let nonce = Nonce::from_slice(&frame.nonce);
 
-        let plaintext = match self
+        let result = self
             .decryptor
             .cipher
-            .decrypt(nonce, frame.ciphertext.as_ref())
-        {
-            Ok(pt) => pt,
+            .decrypt(nonce, frame.ciphertext.as_ref());
+
+        // Always increment counter regardless of success/failure for timing consistency
+        self.inbound_seq.fetch_add(1, Ordering::SeqCst);
+
+        match result {
+            Ok(plaintext) => Ok(plaintext),
             Err(_) => {
                 // Decryption failed - remove the reserved nonce slot so legitimate
                 // retransmissions of the same nonce can still be processed
                 let mut seen = self.seen_nonces.write().unwrap_or_else(|e| e.into_inner());
                 seen.pop(&frame.nonce);
-                return Err(SymmetricError::DecryptionFailed);
+                Err(SymmetricError::DecryptionFailed)
             }
-        };
-
-        self.inbound_seq.fetch_add(1, Ordering::SeqCst);
-
-        Ok(plaintext)
+        }
     }
 
     pub fn outbound_seq(&self) -> u64 {
@@ -344,28 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn test_counter_mode() {
-        let key = [42u8; 32];
-        let crypto = SymmetricCrypto::new(&key);
-
-        let plaintext1 = b"Message 1";
-        let plaintext2 = b"Message 2";
-        let plaintext3 = b"Message 3";
-
-        let ct1 = crypto.encrypt_with_counter(plaintext1, 0).unwrap();
-        let ct2 = crypto.encrypt_with_counter(plaintext2, 1).unwrap();
-        let ct3 = crypto.encrypt_with_counter(plaintext3, 2).unwrap();
-
-        let pt1 = crypto.decrypt_with_counter(&ct1, 0).unwrap();
-        let pt2 = crypto.decrypt_with_counter(&ct2, 1).unwrap();
-        let pt3 = crypto.decrypt_with_counter(&ct3, 2).unwrap();
-
-        assert_eq!(plaintext1, pt1.as_slice());
-        assert_eq!(plaintext2, pt2.as_slice());
-        assert_eq!(plaintext3, pt3.as_slice());
-    }
-
-    #[test]
     fn test_session_crypto_roundtrip() {
         let enc_key = [1u8; 32];
         let mac_key = [2u8; 32];
@@ -417,5 +341,201 @@ mod tests {
         let ct2 = crypto.encrypt(plaintext).unwrap();
 
         assert_ne!(ct1[0..12], ct2[0..12]);
+    }
+
+    #[test]
+    fn test_session_crypto_nonce_format_validation() {
+        let enc_key = [1u8; 32];
+        let mac_key = [2u8; 32];
+        let alice_km = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+        let bob_km = DerivedKeyMaterial::from_parts(&mac_key, &enc_key);
+
+        let alice = SessionCrypto::from_key_material(&alice_km);
+        let bob = SessionCrypto::from_key_material(&bob_km);
+
+        let plaintext = b"Test message for nonce validation";
+
+        // Alice encrypts a message
+        let frame = alice.encrypt_outbound(plaintext).unwrap();
+
+        // Verify nonce structure: [4-byte session prefix][8-byte counter]
+        assert_eq!(frame.nonce.len(), 12);
+
+        // Extract counter from bytes 4-11
+        let counter_bytes: [u8; 8] = frame.nonce[4..12].try_into().unwrap();
+        let counter = u64::from_le_bytes(counter_bytes);
+        assert_eq!(counter, 0); // First message has counter 0
+
+        // CRITICAL: Bob decrypts Alice's message with swapped keys
+        let decrypted = bob.decrypt_inbound(&frame).unwrap();
+        assert_eq!(plaintext, decrypted.as_slice());
+
+        // Send another message - verify counter increments and prefix stays same
+        let frame2 = alice.encrypt_outbound(plaintext).unwrap();
+        let counter_bytes2: [u8; 8] = frame2.nonce[4..12].try_into().unwrap();
+        let counter2 = u64::from_le_bytes(counter_bytes2);
+        assert_eq!(counter2, 1); // Second message has counter 1
+
+        // Session prefix should remain constant
+        assert_eq!(&frame.nonce[0..4], &frame2.nonce[0..4]);
+
+        // Bob can decrypt second message
+        let decrypted2 = bob.decrypt_inbound(&frame2).unwrap();
+        assert_eq!(plaintext, decrypted2.as_slice());
+    }
+
+    #[test]
+    fn test_unique_session_prefixes() {
+        // Verify different SessionCrypto instances have different session prefixes
+        // even with the same keys (prevents nonce collision across sessions)
+        let enc_key = [1u8; 32];
+        let mac_key = [2u8; 32];
+        let km = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+
+        let session1 = SessionCrypto::from_key_material(&km);
+        let session2 = SessionCrypto::from_key_material(&km);
+
+        let plaintext = b"Test";
+
+        let frame1 = session1.encrypt_outbound(plaintext).unwrap();
+        let frame2 = session2.encrypt_outbound(plaintext).unwrap();
+
+        // Extract session prefixes
+        let prefix1 = &frame1.nonce[0..4];
+        let prefix2 = &frame2.nonce[0..4];
+
+        // Different instances should have different random session prefixes
+        // Note: there's a 1 in 4 billion chance this fails spuriously
+        assert_ne!(prefix1, prefix2, "Session prefixes should be unique");
+    }
+
+    #[test]
+    fn test_nonce_replay_protection() {
+        let enc_key = [1u8; 32];
+        let mac_key = [2u8; 32];
+        let alice_km = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+        let bob_km = DerivedKeyMaterial::from_parts(&mac_key, &enc_key);
+
+        let alice = SessionCrypto::from_key_material(&alice_km);
+        let bob = SessionCrypto::from_key_material(&bob_km);
+
+        let plaintext = b"Message to replay";
+
+        // Alice sends message
+        let frame = alice.encrypt_outbound(plaintext).unwrap();
+
+        // Bob decrypts successfully the first time
+        let decrypted = bob.decrypt_inbound(&frame).unwrap();
+        assert_eq!(plaintext, decrypted.as_slice());
+
+        // Replay attack: send same frame again
+        let replay_result = bob.decrypt_inbound(&frame);
+
+        // Should fail with NonceReuse error
+        assert!(replay_result.is_err());
+        match replay_result {
+            Err(SymmetricError::NonceReuse) => {
+                // Expected - replay protection working
+            }
+            _ => panic!("Expected NonceReuse error on replay attack"),
+        }
+    }
+
+    #[test]
+    fn test_high_volume_unique_nonces() {
+        let enc_key = [1u8; 32];
+        let mac_key = [2u8; 32];
+        let km = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+
+        let session = SessionCrypto::from_key_material(&km);
+
+        let plaintext = b"Test";
+        let mut seen_nonces = std::collections::HashSet::new();
+
+        // Generate 10,000 frames and verify all nonces are unique
+        for i in 0..10_000 {
+            let frame = session.encrypt_outbound(plaintext).unwrap();
+
+            // Verify nonce is unique
+            assert!(
+                seen_nonces.insert(frame.nonce),
+                "Duplicate nonce at iteration {}",
+                i
+            );
+
+            // Verify counter is incrementing correctly
+            let counter_bytes: [u8; 8] = frame.nonce[4..12].try_into().unwrap();
+            let counter = u64::from_le_bytes(counter_bytes);
+            assert_eq!(counter, i as u64);
+        }
+
+        assert_eq!(seen_nonces.len(), 10_000);
+    }
+
+    #[test]
+    fn test_bidirectional_communication() {
+        // Test full bidirectional communication between Alice and Bob
+        let enc_key = [1u8; 32];
+        let mac_key = [2u8; 32];
+        let alice_km = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+        let bob_km = DerivedKeyMaterial::from_parts(&mac_key, &enc_key);
+
+        let alice = SessionCrypto::from_key_material(&alice_km);
+        let bob = SessionCrypto::from_key_material(&bob_km);
+
+        // Alice -> Bob
+        let msg1 = b"Hello Bob";
+        let frame1 = alice.encrypt_outbound(msg1).unwrap();
+        let decrypted1 = bob.decrypt_inbound(&frame1).unwrap();
+        assert_eq!(msg1, decrypted1.as_slice());
+
+        // Bob -> Alice
+        let msg2 = b"Hello Alice";
+        let frame2 = bob.encrypt_outbound(msg2).unwrap();
+        let decrypted2 = alice.decrypt_inbound(&frame2).unwrap();
+        assert_eq!(msg2, decrypted2.as_slice());
+
+        // Alice -> Bob again
+        let msg3 = b"How are you?";
+        let frame3 = alice.encrypt_outbound(msg3).unwrap();
+        let decrypted3 = bob.decrypt_inbound(&frame3).unwrap();
+        assert_eq!(msg3, decrypted3.as_slice());
+
+        // Verify sequence counters
+        assert_eq!(alice.outbound_seq(), 2);
+        assert_eq!(alice.inbound_seq(), 1);
+        assert_eq!(bob.outbound_seq(), 1);
+        assert_eq!(bob.inbound_seq(), 2);
+    }
+
+    #[test]
+    fn test_out_of_order_delivery() {
+        // Test that out-of-order frames are handled correctly (no replay protection issue)
+        let enc_key = [1u8; 32];
+        let mac_key = [2u8; 32];
+        let alice_km = DerivedKeyMaterial::from_parts(&enc_key, &mac_key);
+        let bob_km = DerivedKeyMaterial::from_parts(&mac_key, &enc_key);
+
+        let alice = SessionCrypto::from_key_material(&alice_km);
+        let bob = SessionCrypto::from_key_material(&bob_km);
+
+        // Alice sends 3 messages
+        let msg1 = b"Message 1";
+        let msg2 = b"Message 2";
+        let msg3 = b"Message 3";
+
+        let frame1 = alice.encrypt_outbound(msg1).unwrap();
+        let frame2 = alice.encrypt_outbound(msg2).unwrap();
+        let frame3 = alice.encrypt_outbound(msg3).unwrap();
+
+        // Bob receives them out of order: 2, 1, 3
+        let dec2 = bob.decrypt_inbound(&frame2).unwrap();
+        assert_eq!(msg2, dec2.as_slice());
+
+        let dec1 = bob.decrypt_inbound(&frame1).unwrap();
+        assert_eq!(msg1, dec1.as_slice());
+
+        let dec3 = bob.decrypt_inbound(&frame3).unwrap();
+        assert_eq!(msg3, dec3.as_slice());
     }
 }

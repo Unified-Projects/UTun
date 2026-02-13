@@ -26,7 +26,7 @@ pub struct Connection {
     service_name: RwLock<Option<String>>,
     target_addr: RwLock<Option<SocketAddr>>,
     tx_to_tunnel: mpsc::Sender<Frame>,
-    rx_from_tunnel: RwLock<Option<mpsc::Receiver<Frame>>>,
+    pub rx_from_tunnel: RwLock<Option<mpsc::Receiver<Frame>>>,
 }
 
 impl Connection {

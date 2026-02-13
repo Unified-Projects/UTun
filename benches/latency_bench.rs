@@ -104,7 +104,7 @@ fn benchmark_handshake_latency(c: &mut Criterion) {
 }
 
 fn benchmark_frame_processing_latency(c: &mut Criterion) {
-    use utun::tunnel::{Frame, Protocol};
+    use utun::tunnel::Frame;
 
     let sizes = [64, 256, 1024, 4096];
 
@@ -144,7 +144,7 @@ fn benchmark_end_to_end_latency(c: &mut Criterion) {
 
                     // Simulate full round trip with crypto
                     use utun::crypto::symmetric::SymmetricCrypto;
-                    use utun::tunnel::{Frame, Protocol};
+                    use utun::tunnel::Frame;
 
                     let key = [0u8; 32];
                     let crypto = SymmetricCrypto::new(&key);

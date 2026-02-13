@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-02-13
+
+### Added
+- Frame demultiplexing system in source container to route incoming frames to correct connection handlers via connection registry
+- Comprehensive session crypto tests including nonce format validation, replay protection, high-volume unique nonces, bidirectional communication, and out-of-order delivery
+- Three new test suites: demux_tests.rs, end_to_end_tests.rs, and full_system_tests.rs for integration testing
+- Port reuse support with SO_REUSEADDR and SO_REUSEPORT for better socket management
+- Port fallback logic that tries up to 5 additional ports if the configured port is in use
+
+### Fixed
+- Session crypto now uses proper session-prefixed nonces (4-byte session prefix + 8-byte counter) instead of counter-only nonces to prevent nonce collisions across sessions
+- Timing attack vulnerability by always incrementing sequence counter regardless of decryption success/failure
+- Bidirectional crypto key ordering in destination container (swapped enc_key and mac_key for proper symmetric communication)
+- Connection state handling by making rx_from_tunnel public for demux access
+
+### Changed
+- Split tunnel stream into separate read/write halves to avoid lock contention
+- Refactored frame reception to use dedicated demux task instead of direct receive_frame calls
+- Simplified handshake flow by removing excessive logging throughout codebase
+- Improved connection handling with better timeout management and cleanup
+
+### Removed
+- Unused counter-mode encryption methods (encrypt_with_counter, decrypt_with_counter, nonce_from_counter)
+- Counter-mode tests and benchmarks that are no longer relevant
+- Excessive/over-the-top log messages across source and destination containers
+
 ## [0.1.3] - 2026-02-12
 
 ### Added

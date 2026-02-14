@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-02-14
+
+### Added
+- Resilience module with circuit breaker to prevent infinite demux restart loops
+- Demux task watchdog for automatic recovery from task failures
+- Tunnel metrics tracking for observability (demux restarts, channel full events, frames dropped, lock wait times, heartbeat timeouts)
+- Configurable channel sizes for connection management (`connection_channel_size` in source and dest configs)
+- Circuit breaker configuration options (`circuit_breaker_window_secs`, `circuit_breaker_max_restarts`)
+- Dedicated writer task for lock-free frame sending via unbounded write queue
+
+### Fixed
+- Heartbeat race condition where pong could arrive after timeout check began, now uses atomic flag checked atomically before timeout
+- Potential deadlock in destination response channel by switching to unbounded channel (monitored via metrics for backpressure)
+- Lock contention during frame writes by implementing dedicated writer task that minimizes critical section to just write/flush operations
+- Clippy dead_code warnings by adding appropriate allow attributes to config fields and public API methods not yet used
+
+### Changed
+- Source demux task now takes ownership of tunnel read half for lock-free operation (no mutex on read path)
+- Connection channels now use configurable size (default 1024) instead of hardcoded 100
+- Heartbeat pong detection now atomic (flag cleared before ping sent, checked atomically after timeout)
+- Frame sending now uses unbounded write queue instead of direct writes (eliminates per-frame lock acquisition)
+
 ## [0.1.4] - 2026-02-13
 
 ### Added

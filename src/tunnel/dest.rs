@@ -115,17 +115,22 @@ pub struct DestContainer {
     /// Maps connection_id -> target connection write half for data forwarding
     target_connections: Arc<RwLock<HashMap<u32, TargetConnection>>>,
     /// Channel to send response frames back to the tunnel
-    response_tx: Arc<RwLock<Option<mpsc::Sender<Frame>>>>,
+    response_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Frame>>>>,
     /// Maximum handshake message size (depends on KEM mode)
     max_handshake_size: u32,
+    /// Channel size configuration
+    channel_size: usize,
 }
 
 impl DestContainer {
     pub async fn new(config: DestConfig, crypto_config: CryptoConfig) -> Result<Self, DestError> {
+        let channel_size = config.connection_channel_size;
+
         let key_manager = Arc::new(KeyManager::new(3600, 300)); // 1 hour rotation, 5 min window
-        let connection_manager = Arc::new(ConnectionManager::new(
+        let connection_manager = Arc::new(ConnectionManager::new_with_channel_size(
             config.max_connections_per_service * config.exposed_services.len(),
             config.connection_timeout_ms,
+            channel_size,
         ));
         let service_registry = Arc::new(ServiceRegistry::new(config.exposed_services.clone()));
 
@@ -149,6 +154,7 @@ impl DestContainer {
             target_connections: Arc::new(RwLock::new(HashMap::new())),
             response_tx: Arc::new(RwLock::new(None)),
             max_handshake_size,
+            channel_size,
         })
     }
 
@@ -211,13 +217,20 @@ impl DestContainer {
         drop(codec);
 
         // Create channel for response frames from target connections
-        let (response_tx, mut response_rx) = mpsc::channel::<Frame>(256);
+        // Use unbounded to prevent backpressure deadlock (monitored via metrics)
+        let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Frame>();
 
         // Store the response sender
         {
             let mut tx = self.response_tx.write().await;
             *tx = Some(response_tx.clone());
         }
+
+        // Log channel configuration
+        tracing::info!(
+            "Response channel configured as unbounded for connection from {}",
+            addr
+        );
 
         // Handle incoming frames
         let connection_manager = self.connection_manager.clone();
@@ -326,7 +339,7 @@ impl DestContainer {
 
             // Send response if any (through the channel)
             if let Some(resp_frame) = response {
-                if response_tx.send(resp_frame).await.is_err() {
+                if response_tx.send(resp_frame).is_err() {
                     tracing::error!("Failed to send response - channel closed");
                     break;
                 }
@@ -460,7 +473,7 @@ impl DestContainer {
         connection_manager: &Arc<ConnectionManager>,
         service_registry: &Arc<ServiceRegistry>,
         metrics: &Arc<DestMetrics>,
-        response_tx: &mpsc::Sender<Frame>,
+        response_tx: &mpsc::UnboundedSender<Frame>,
     ) -> Option<Frame> {
         match frame.frame_type() {
             FrameType::Connect => {
@@ -544,7 +557,7 @@ impl DestContainer {
                                 if let Ok(mut close_frame) = Frame::new_data(connection_id, 0, &[])
                                 {
                                     close_frame.set_fin();
-                                    let _ = response_tx_clone.send(close_frame).await;
+                                    let _ = response_tx_clone.send(close_frame);
                                 }
                                 break;
                             }
@@ -553,7 +566,7 @@ impl DestContainer {
                                 conn_clone.record_receive(n);
                                 if let Ok(data_frame) = Frame::new_data(connection_id, 0, &buf[..n])
                                 {
-                                    if response_tx_clone.send(data_frame).await.is_err() {
+                                    if response_tx_clone.send(data_frame).is_err() {
                                         tracing::error!(
                                             "Failed to send data frame - channel closed"
                                         );
@@ -715,6 +728,7 @@ impl Clone for DestContainer {
             target_connections: self.target_connections.clone(),
             response_tx: self.response_tx.clone(),
             max_handshake_size: self.max_handshake_size,
+            channel_size: self.channel_size,
         }
     }
 }

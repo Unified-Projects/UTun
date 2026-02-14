@@ -4,6 +4,9 @@
 //! post-quantum cryptography (ML-KEM-768 + Classic McEliece 460896) for
 //! key exchange and AES-256-GCM for symmetric encryption.
 
+// Allow dead code for library API methods not yet used
+#![allow(dead_code)]
+
 pub mod cert;
 pub mod config;
 pub mod crypto;

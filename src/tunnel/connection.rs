@@ -16,6 +16,7 @@ pub enum ConnectionState {
     Closed,
 }
 
+#[allow(dead_code)] // Fields used by public API methods
 pub struct Connection {
     id: u32,
     remote_addr: SocketAddr,
@@ -36,8 +37,18 @@ impl Connection {
         _protocol: Protocol,
         _service_port: u16,
     ) -> (Self, mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
-        let (tx_to_tunnel, rx_to_tunnel) = mpsc::channel(100);
-        let (tx_from_tunnel, rx_from_tunnel) = mpsc::channel(100);
+        Self::new_with_channel_size(id, remote_addr, _protocol, _service_port, 1024)
+    }
+
+    pub fn new_with_channel_size(
+        id: u32,
+        remote_addr: SocketAddr,
+        _protocol: Protocol,
+        _service_port: u16,
+        channel_size: usize,
+    ) -> (Self, mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
+        let (tx_to_tunnel, rx_to_tunnel) = mpsc::channel(channel_size);
+        let (tx_from_tunnel, rx_from_tunnel) = mpsc::channel(channel_size);
 
         let conn = Self {
             id,
@@ -85,10 +96,12 @@ impl Connection {
         self.id
     }
 
+    #[allow(dead_code)] // Public API method
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
+    #[allow(dead_code)] // Public API method
     pub async fn set_service(&self, name: String, target: SocketAddr) {
         let mut sn = self.service_name.write().await;
         *sn = Some(name);
@@ -96,14 +109,17 @@ impl Connection {
         *ta = Some(target);
     }
 
+    #[allow(dead_code)] // Public API method
     pub async fn service_name(&self) -> Option<String> {
         self.service_name.read().await.clone()
     }
 
+    #[allow(dead_code)] // Public API method
     pub async fn target_addr(&self) -> Option<SocketAddr> {
         *self.target_addr.read().await
     }
 
+    #[allow(dead_code)] // Public API method
     pub async fn send_to_tunnel(&self, frame: Frame) -> Result<(), ConnectionError> {
         self.tx_to_tunnel
             .send(frame)
@@ -111,6 +127,7 @@ impl Connection {
             .map_err(|_| ConnectionError::ChannelClosed)
     }
 
+    #[allow(dead_code)] // Public API method
     pub async fn recv_from_tunnel(&self) -> Result<Frame, ConnectionError> {
         let mut rx_guard = self.rx_from_tunnel.write().await;
         if let Some(ref mut rx) = *rx_guard {
@@ -166,15 +183,25 @@ pub struct ConnectionManager {
     connections: RwLock<HashMap<u32, Arc<Connection>>>,
     max_connections: usize,
     connection_timeout: Duration,
+    channel_size: usize,
 }
 
 impl ConnectionManager {
     pub fn new(max_connections: usize, connection_timeout_ms: u64) -> Self {
+        Self::new_with_channel_size(max_connections, connection_timeout_ms, 1024)
+    }
+
+    pub fn new_with_channel_size(
+        max_connections: usize,
+        connection_timeout_ms: u64,
+        channel_size: usize,
+    ) -> Self {
         Self {
             next_id: AtomicU32::new(1),
             connections: RwLock::new(HashMap::new()),
             max_connections,
             connection_timeout: Duration::from_millis(connection_timeout_ms),
+            channel_size,
         }
     }
 
@@ -194,7 +221,13 @@ impl ConnectionManager {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (conn, tx, rx) = Connection::new(id, remote_addr, protocol, service_port);
+        let (conn, tx, rx) = Connection::new_with_channel_size(
+            id,
+            remote_addr,
+            protocol,
+            service_port,
+            self.channel_size,
+        );
         let conn = Arc::new(conn);
 
         connections.insert(id, conn.clone());

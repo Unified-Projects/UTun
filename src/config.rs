@@ -18,6 +18,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct Config {
     pub source: Option<SourceConfig>,
     pub dest: Option<DestConfig>,
@@ -28,6 +29,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct SourceConfig {
     #[serde(default = "default_listen_ip")]
     pub listen_ip: String,
@@ -76,6 +78,17 @@ pub struct SourceConfig {
     #[serde(default = "default_frame_buffer_size")]
     pub frame_buffer_size: usize,
 
+    // Channel configuration
+    #[serde(default = "default_connection_channel_size")]
+    pub connection_channel_size: usize,
+
+    // Circuit breaker configuration
+    #[serde(default = "default_circuit_breaker_window_secs")]
+    pub circuit_breaker_window_secs: u64,
+
+    #[serde(default = "default_circuit_breaker_max_restarts")]
+    pub circuit_breaker_max_restarts: usize,
+
     #[serde(default)]
     pub allowed_outbound: AllowedOutboundConfig,
 
@@ -92,6 +105,7 @@ pub struct SourceConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct DestConfig {
     #[serde(default = "default_listen_ip")]
     pub listen_ip: String,
@@ -109,6 +123,10 @@ pub struct DestConfig {
     #[serde(default = "default_target_timeout")]
     pub target_connect_timeout_ms: u64,
 
+    // Channel configuration
+    #[serde(default = "default_connection_channel_size")]
+    pub connection_channel_size: usize,
+
     #[serde(default)]
     pub connection_filter: ConnectionFilterConfig,
 
@@ -122,6 +140,7 @@ pub struct DestConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct AuthConfig {
     #[serde(default = "default_mtls")]
     pub use_mtls: bool,
@@ -139,6 +158,7 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct CryptoConfig {
     #[serde(default = "default_kem_mode")]
     pub kem_mode: KemMode,
@@ -220,6 +240,7 @@ pub struct ExposedPortConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct ServiceConfig {
     pub name: String,
     pub port: u16,
@@ -231,6 +252,7 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    #[allow(dead_code)] // Public API method
     pub fn get_protocol(&self) -> crate::tunnel::Protocol {
         match self.protocol.to_lowercase().as_str() {
             "udp" => crate::tunnel::Protocol::Udp,
@@ -246,6 +268,7 @@ pub struct ConnectionFilterConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Config fields loaded from TOML
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -361,6 +384,15 @@ fn default_max_reconnect_delay() -> u64 {
 fn default_frame_buffer_size() -> usize {
     1000
 }
+fn default_connection_channel_size() -> usize {
+    1024
+}
+fn default_circuit_breaker_window_secs() -> u64 {
+    60
+}
+fn default_circuit_breaker_max_restarts() -> usize {
+    5
+}
 
 /// Load configuration from file
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
@@ -455,6 +487,7 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
 
 impl SourceConfig {
     /// Check if IP is allowed for outbound connections
+    #[allow(dead_code)] // Public API method
     pub fn is_ip_allowed(&self, ip: std::net::IpAddr) -> bool {
         for cidr in &self.allowed_outbound.allowed_ips {
             if let Ok(network) = cidr.parse::<IpNetwork>() {
@@ -469,6 +502,7 @@ impl SourceConfig {
 
 impl DestConfig {
     /// Check if source IP is allowed
+    #[allow(dead_code)] // Public API method
     pub fn is_source_allowed(&self, ip: std::net::IpAddr) -> bool {
         for cidr in &self.connection_filter.allowed_source_ips {
             if let Ok(network) = cidr.parse::<IpNetwork>() {

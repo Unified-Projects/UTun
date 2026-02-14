@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -82,15 +82,18 @@ pub struct PortListener {
 }
 
 #[derive(Default)]
+#[allow(dead_code)] // Used by multi-port listener mode
 pub struct ListenerManager {
     listeners: Vec<PortListener>,
 }
 
 impl ListenerManager {
+    #[allow(dead_code)] // Public API method
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[allow(dead_code)] // Public API method
     pub async fn add_listener(
         &mut self,
         listen_ip: &str,
@@ -117,6 +120,7 @@ impl ListenerManager {
         Ok(())
     }
 
+    #[allow(dead_code)] // Public API method
     pub fn listeners(&self) -> &[PortListener] {
         &self.listeners
     }
@@ -129,6 +133,7 @@ struct HeartbeatState {
     last_ping_time: Arc<RwLock<Option<Instant>>>,
     consecutive_misses: Arc<RwLock<u8>>,
     rtt_avg_us: Arc<RwLock<Option<u64>>>,
+    pong_received: Arc<AtomicBool>, // Atomic flag for race-free pong detection
 }
 
 impl HeartbeatState {
@@ -139,6 +144,7 @@ impl HeartbeatState {
             last_ping_time: Arc::new(RwLock::new(None)),
             consecutive_misses: Arc::new(RwLock::new(0)),
             rtt_avg_us: Arc::new(RwLock::new(None)),
+            pong_received: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -182,10 +188,6 @@ impl HeartbeatState {
         let mut misses = self.consecutive_misses.write().await;
         *misses = misses.saturating_add(1);
         *misses
-    }
-
-    async fn get_consecutive_misses(&self) -> u8 {
-        *self.consecutive_misses.read().await
     }
 
     #[allow(dead_code)]
@@ -300,6 +302,7 @@ impl ReconnectionManager {
         self.attempt.store(0, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)] // Public API method
     pub fn get_attempt_count(&self) -> u32 {
         self.attempt.load(Ordering::SeqCst)
     }
@@ -322,6 +325,16 @@ pub struct SourceContainer {
     ping_sequence: Arc<AtomicU32>,
     /// Registry mapping connection_id to tx_from_tunnel for frame demultiplexing
     connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>>,
+    /// Write queue for lock-free frame sending
+    write_queue_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Frame>>>>,
+    /// Demux task handle for monitoring
+    demux_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Resilience components
+    tunnel_metrics: Arc<super::resilience::TunnelMetrics>,
+    circuit_breaker: Arc<super::resilience::CircuitBreaker>,
+    demux_watchdog: Arc<super::resilience::DemuxWatchdog>,
+    /// Flag to trigger reconnection
+    reconnection_needed: Arc<AtomicBool>,
 }
 
 /// Helper function to create TcpListener with SO_REUSEADDR and SO_REUSEPORT enabled
@@ -396,9 +409,10 @@ impl SourceContainer {
         crypto_config: CryptoConfig,
     ) -> Result<Self, SourceError> {
         let key_manager = Arc::new(KeyManager::new(3600, 300)); // 1 hour rotation, 5 min window
-        let connection_manager = Arc::new(ConnectionManager::new(
+        let connection_manager = Arc::new(ConnectionManager::new_with_channel_size(
             config.max_connections,
             config.connection_timeout_ms,
+            config.connection_channel_size,
         ));
 
         let (shutdown_tx, _) = watch::channel(false);
@@ -408,6 +422,17 @@ impl SourceContainer {
         health_monitor.set_status(HealthStatus::Starting).await;
 
         let max_handshake_size = crypto_config.effective_max_handshake_size();
+
+        // Initialize resilience components
+        let tunnel_metrics = Arc::new(super::resilience::TunnelMetrics::new());
+        let circuit_breaker = Arc::new(super::resilience::CircuitBreaker::new(
+            Duration::from_secs(config.circuit_breaker_window_secs),
+            config.circuit_breaker_max_restarts,
+        ));
+        let demux_watchdog = Arc::new(super::resilience::DemuxWatchdog::new(
+            circuit_breaker.clone(),
+            tunnel_metrics.clone(),
+        ));
 
         Ok(Self {
             config,
@@ -424,6 +449,12 @@ impl SourceContainer {
             heartbeat_state: Arc::new(HeartbeatState::new()),
             ping_sequence: Arc::new(AtomicU32::new(0)),
             connection_registry: Arc::new(RwLock::new(HashMap::new())),
+            write_queue_tx: Arc::new(RwLock::new(None)),
+            demux_handle: Arc::new(RwLock::new(None)),
+            tunnel_metrics,
+            circuit_breaker,
+            demux_watchdog,
+            reconnection_needed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -526,6 +557,7 @@ impl SourceContainer {
         self.connection_manager.close_all().await;
     }
 
+    #[allow(dead_code)] // Public API method
     pub fn is_running(&self) -> bool {
         !*self.shutdown.borrow()
     }
@@ -738,27 +770,42 @@ impl SourceContainer {
         }
 
         // Spawn demux task after handshake completes
-        self.spawn_demux_task();
+        self.spawn_demux_task().await;
+
+        // Spawn write queue task for lock-free writes
+        self.spawn_writer_task().await;
 
         Ok(())
     }
 
     /// Spawns background task to demultiplex incoming frames to the correct connection handlers
-    fn spawn_demux_task(&self) {
+    async fn spawn_demux_task(&self) {
         let registry = self.connection_registry.clone();
         let frame_codec = self.frame_codec.clone();
-        let tunnel_read = self.tunnel_read.clone();
         let heartbeat_state = self.heartbeat_state.clone();
         let health_monitor = self.health_monitor.clone();
         let mut shutdown = self.shutdown.subscribe();
 
-        tokio::spawn(async move {
+        // Take ownership of read half for lock-free operation
+        let mut tunnel_read_owned = {
+            let mut guard = self.tunnel_read.lock().await;
+            guard.take()
+        };
+
+        let handle = tokio::spawn(async move {
+            let mut read_half = match tunnel_read_owned.take() {
+                Some(r) => r,
+                None => {
+                    tracing::error!("Demux: no tunnel read half available");
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => {
                         break;
                     }
-                    frame_result = Self::read_frame_static(&frame_codec, &tunnel_read, &heartbeat_state, &health_monitor) => {
+                    frame_result = Self::read_frame_static(&frame_codec, &mut read_half, &heartbeat_state, &health_monitor) => {
                         match frame_result {
                             Ok(frame) => {
                                 let frame_type = frame.frame_type();
@@ -793,20 +840,97 @@ impl SourceContainer {
                 }
             }
         });
+
+        // Store handle and register with watchdog
+        let mut demux_handle_guard = self.demux_handle.write().await;
+        *demux_handle_guard = Some(handle);
+        drop(demux_handle_guard);
+
+        // Demux task spawned successfully
+        tracing::info!("Demux task spawned and ready for watchdog monitoring");
+    }
+
+    /// Spawns dedicated writer task for lock-free frame sending
+    async fn spawn_writer_task(&self) {
+        let (write_queue_tx, mut write_queue_rx) = mpsc::unbounded_channel::<Frame>();
+
+        // Store the sender
+        {
+            let mut tx_guard = self.write_queue_tx.write().await;
+            *tx_guard = Some(write_queue_tx);
+        }
+
+        let tunnel_write = self.tunnel_write.clone();
+        let frame_codec = self.frame_codec.clone();
+        let mut shutdown = self.shutdown.subscribe();
+        let metrics = self.tunnel_metrics.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        tracing::info!("Writer task shutting down");
+                        break;
+                    }
+                    Some(frame) = write_queue_rx.recv() => {
+                        // Encode frame
+                        let codec_guard = frame_codec.read().await;
+                        let codec = match codec_guard.as_ref() {
+                            Some(c) => c,
+                            None => {
+                                tracing::error!("Writer: no codec available");
+                                continue;
+                            }
+                        };
+
+                        let wire_frame = match codec.encode(&frame) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                tracing::error!("Writer: failed to encode frame: {}", e);
+                                continue;
+                            }
+                        };
+                        drop(codec_guard);
+
+                        // Acquire lock ONLY for write/flush (minimal critical section)
+                        let lock_start = Instant::now();
+                        let mut tunnel_write_guard = tunnel_write.lock().await;
+                        metrics.record_lock_wait(lock_start.elapsed());
+
+                        if let Some(stream) = tunnel_write_guard.as_mut() {
+                            if let Err(e) = stream.write_u32(wire_frame.len() as u32).await {
+                                tracing::error!("Writer: failed to write length: {}", e);
+                                break;
+                            }
+                            if let Err(e) = stream.write_all(wire_frame.as_bytes()).await {
+                                tracing::error!("Writer: failed to write data: {}", e);
+                                break;
+                            }
+                            if let Err(e) = stream.flush().await {
+                                tracing::error!("Writer: failed to flush: {}", e);
+                                break;
+                            }
+                        } else {
+                            tracing::error!("Writer: no tunnel write half available");
+                            break;
+                        }
+                        // Lock released here
+                    }
+                }
+            }
+            tracing::warn!("Writer task exited");
+        });
+
+        tracing::info!("Writer task spawned for lock-free frame sending");
     }
 
     /// Static version of receive_frame for use in demux task
     async fn read_frame_static(
         frame_codec: &Arc<RwLock<Option<Arc<FrameCodec>>>>,
-        tunnel_read: &Arc<Mutex<Option<OwnedReadHalf>>>,
+        stream: &mut OwnedReadHalf,
         heartbeat_state: &Arc<HeartbeatState>,
         health_monitor: &Arc<HealthMonitor>,
     ) -> Result<Frame, SourceError> {
-        let mut tunnel_read_guard = tunnel_read.lock().await;
-        let stream = tunnel_read_guard
-            .as_mut()
-            .ok_or(SourceError::NotConnected)?;
-
         // Read frame length with timeout
         let len = match timeout(FRAME_READ_TIMEOUT, stream.read_u32()).await {
             Ok(Ok(l)) => l,
@@ -838,6 +962,8 @@ impl SourceContainer {
         // Handle Pong frames for heartbeat
         if frame.frame_type() == FrameType::Pong {
             let seq = frame.sequence();
+            // Set atomic flag FIRST to avoid race with timeout check
+            heartbeat_state.pong_received.store(true, Ordering::SeqCst);
             if let Some(rtt) = heartbeat_state.record_pong_received(seq).await {
                 tracing::debug!("Received pong (seq={}) RTT: {:?}", seq, rtt);
                 health_monitor.record_success().await;
@@ -889,25 +1015,29 @@ impl SourceContainer {
 
                             tracing::debug!("Sending heartbeat ping (seq={})", seq);
 
+                            // Clear pong flag BEFORE sending ping (fixes race condition)
+                            state.pong_received.store(false, Ordering::SeqCst);
+
                             match container.send_frame(ping).await {
                                 Ok(_) => {
                                     state.record_ping_sent(seq).await;
 
-                                    // Wait for pong (processed in receive_frame)
+                                    // Wait for pong (processed in read_frame_static)
                                     tokio::time::sleep(timeout_duration).await;
 
-                                    // Check if pong was received
-                                    let misses = state.get_consecutive_misses().await;
-                                    if misses > 0 {
+                                    // Check if pong was received atomically
+                                    if !state.pong_received.load(Ordering::SeqCst) {
                                         let total = state.record_ping_timeout().await;
                                         tracing::warn!("Heartbeat timeout (seq={}), consecutive misses: {}", seq, total);
 
                                         health.record_error().await;
+                                        container.tunnel_metrics.record_heartbeat_timeout();
 
                                         if total >= max_missed {
                                             tracing::error!("Heartbeat failed: {} consecutive timeouts", total);
                                             health.set_status(HealthStatus::Unhealthy).await;
-                                            // Trigger reconnection (will be handled by reconnection manager)
+                                            // Trigger reconnection
+                                            container.reconnection_needed.store(true, Ordering::SeqCst);
                                         } else if total >= max_missed / 2 {
                                             health.set_status(HealthStatus::Degraded).await;
                                         }
@@ -1065,23 +1195,17 @@ impl SourceContainer {
     }
 
     pub async fn send_frame(&self, frame: Frame) -> Result<(), SourceError> {
-        let codec = self.frame_codec.read().await;
-        let codec = codec.as_ref().ok_or(SourceError::NotConnected)?;
-
-        let wire_frame = codec.encode(&frame)?;
-
-        let mut tunnel_write_guard = self.tunnel_write.lock().await;
-        let stream = tunnel_write_guard
-            .as_mut()
-            .ok_or(SourceError::NotConnected)?;
-
-        stream.write_u32(wire_frame.len() as u32).await?;
-        stream.write_all(wire_frame.as_bytes()).await?;
-        stream.flush().await?;
-
-        Ok(())
+        // Use write queue for lock-free sending
+        let tx_guard = self.write_queue_tx.read().await;
+        if let Some(ref tx) = *tx_guard {
+            tx.send(frame).map_err(|_| SourceError::NotConnected)?;
+            Ok(())
+        } else {
+            Err(SourceError::NotConnected)
+        }
     }
 
+    #[allow(dead_code)] // Public API method (deprecated in favor of demux)
     pub async fn receive_frame(&self) -> Result<Frame, SourceError> {
         let mut tunnel_stream = self.tunnel_stream.write().await;
         let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
@@ -1230,6 +1354,12 @@ impl Clone for SourceContainer {
             heartbeat_state: self.heartbeat_state.clone(),
             ping_sequence: self.ping_sequence.clone(),
             connection_registry: self.connection_registry.clone(),
+            write_queue_tx: self.write_queue_tx.clone(),
+            demux_handle: self.demux_handle.clone(),
+            tunnel_metrics: self.tunnel_metrics.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
+            demux_watchdog: self.demux_watchdog.clone(),
+            reconnection_needed: self.reconnection_needed.clone(),
         }
     }
 }

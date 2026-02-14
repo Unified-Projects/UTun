@@ -1,3 +1,6 @@
+// Allow dead code for library API methods not yet used
+#![allow(dead_code)]
+
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

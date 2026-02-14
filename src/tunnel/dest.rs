@@ -18,8 +18,8 @@ use tokio::time::{timeout, Duration};
 // Maximum frame size to prevent memory exhaustion (1MB)
 const MAX_FRAME_SIZE: u32 = 1024 * 1024;
 
-// Frame read timeout to prevent slowloris attacks (30 seconds)
-const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
+// Frame read timeout (must exceed heartbeat interval to allow pings during idle periods)
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Handshake timeout per message (increased for large McEliece keys)
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);

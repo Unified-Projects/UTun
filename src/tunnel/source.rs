@@ -16,8 +16,8 @@ const MAX_FRAME_SIZE: u32 = 1024 * 1024;
 // Handshake timeout per message (increased for large McEliece keys)
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Frame read timeout (30 seconds)
-const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
+// Frame read timeout (must exceed heartbeat interval to allow pongs during idle periods)
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(60);
 use super::{
     ConnectionError, ConnectionManager, Frame, FrameCodec, FrameError, FrameType, HandshakeContext,
     HandshakeError, Protocol,
@@ -987,13 +987,10 @@ impl SourceContainer {
 
     /// Spawns background task to send periodic heartbeat pings
     async fn spawn_heartbeat_task(&self) -> Result<(), SourceError> {
-        if !self.config.reconnection_enabled {
-            return Ok(());
-        }
-
         let interval = Duration::from_millis(self.config.heartbeat_interval_ms);
         let timeout_duration = Duration::from_millis(self.config.heartbeat_timeout_ms);
         let max_missed = self.config.max_missed_pongs;
+        let reconnection_enabled = self.config.reconnection_enabled;
 
         let state = self.heartbeat_state.clone();
         let container = Arc::new(self.clone());
@@ -1036,8 +1033,9 @@ impl SourceContainer {
                                         if total >= max_missed {
                                             tracing::error!("Heartbeat failed: {} consecutive timeouts", total);
                                             health.set_status(HealthStatus::Unhealthy).await;
-                                            // Trigger reconnection
-                                            container.reconnection_needed.store(true, Ordering::SeqCst);
+                                            if reconnection_enabled {
+                                                container.reconnection_needed.store(true, Ordering::SeqCst);
+                                            }
                                         } else if total >= max_missed / 2 {
                                             health.set_status(HealthStatus::Degraded).await;
                                         }
@@ -1100,6 +1098,7 @@ impl SourceContainer {
                         conn_id
                     );
                     self.unregister_connection(conn_id).await;
+                    self.connection_manager.remove_connection(conn_id).await;
                     return Err(SourceError::ConfigError(
                         "Channel closed while waiting for CONNECT_ACK".to_string(),
                     ));
@@ -1111,17 +1110,20 @@ impl SourceContainer {
                     fin_frame.set_fin();
                     let _ = self.send_frame(fin_frame).await;
                     self.unregister_connection(conn_id).await;
+                    self.connection_manager.remove_connection(conn_id).await;
                     return Ok(()); // Clean exit
                 }
             };
 
         if ack_frame.frame_type() != FrameType::ConnectAck {
             self.unregister_connection(conn_id).await;
+            self.connection_manager.remove_connection(conn_id).await;
             return Err(SourceError::ConfigError("Expected CONNECT_ACK".to_string()));
         }
 
         if ack_frame.payload().is_empty() || ack_frame.payload()[0] == 0 {
             self.unregister_connection(conn_id).await;
+            self.connection_manager.remove_connection(conn_id).await;
             return Err(SourceError::ConfigError("Connection rejected".to_string()));
         }
 
@@ -1186,9 +1188,13 @@ impl SourceContainer {
                 }
             }
 
-            // Cleanup: unregister connection from demux registry
+            // Cleanup connection from registry and manager
             self_clone.unregister_connection(conn_clone.id()).await;
             conn_clone.set_state(super::ConnectionState::Closed).await;
+            self_clone
+                .connection_manager
+                .remove_connection(conn_clone.id())
+                .await;
         });
 
         Ok(())

@@ -147,6 +147,8 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v4
         with:
           path: artifacts
+          pattern: utun-*
+          merge-multiple: false
 
       - name: Upload to release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0

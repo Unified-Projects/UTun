@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-02-14
+
+### Fixed
+- Frame read timeout increased from 30s to 60s to prevent heartbeat timeout during idle periods
+- Heartbeat task now respects reconnection_enabled setting
+- Connection cleanup now properly removes from both demux registry and connection manager
+- GitHub Actions release workflow artifact download configuration
+
 ## [0.1.5] - 2026-02-14
 
 ### Added

@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 // Maximum frame size to prevent memory exhaustion (1MB)
@@ -98,9 +98,10 @@ impl ServiceRegistry {
     }
 }
 
-/// Stores the write half of a target connection for forwarding data
+/// Stores the write half of a target connection for forwarding data.
+/// Writer is behind a Mutex so the HashMap only needs a read lock for data forwarding.
 struct TargetConnection {
-    writer: OwnedWriteHalf,
+    writer: Mutex<OwnedWriteHalf>,
 }
 
 pub struct DestContainer {
@@ -113,7 +114,7 @@ pub struct DestContainer {
     metrics: Arc<DestMetrics>,
     health_monitor: Arc<HealthMonitor>,
     /// Maps connection_id -> target connection write half for data forwarding
-    target_connections: Arc<RwLock<HashMap<u32, TargetConnection>>>,
+    target_connections: Arc<RwLock<HashMap<u32, Arc<TargetConnection>>>>,
     /// Channel to send response frames back to the tunnel
     response_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Frame>>>>,
     /// Maximum handshake message size (depends on KEM mode)
@@ -237,34 +238,81 @@ impl DestContainer {
         let service_registry = self.service_registry.clone();
         let metrics = self.metrics.clone();
 
+        // Set TCP_NODELAY for lower latency on the tunnel socket
+        stream.set_nodelay(true).ok();
+
         // Split stream for concurrent read/write
         let (mut read_half, mut write_half) = stream.into_split();
 
-        // Spawn writer task to handle response frames
+        // Spawn writer task to handle response frames with batch flush optimization
         let frame_codec_clone = frame_codec.clone();
         let writer_handle = tokio::spawn(async move {
             while let Some(frame) = response_rx.recv().await {
-                let wire_frame = match frame_codec_clone.encode(&frame) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!("Failed to encode response: {}", e);
-                        continue;
+                // Collect this frame plus any additional pending frames for batch write
+                let mut frames_to_write = vec![frame];
+                while let Ok(extra) = response_rx.try_recv() {
+                    frames_to_write.push(extra);
+                }
+
+                let mut write_error = false;
+                for f in &frames_to_write {
+                    let wire_frame = match frame_codec_clone.encode(f) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::error!("Failed to encode response: {}", e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = write_half.write_u32(wire_frame.len() as u32).await {
+                        tracing::error!("Failed to write response length: {}", e);
+                        write_error = true;
+                        break;
                     }
-                };
 
-                if let Err(e) = write_half.write_u32(wire_frame.len() as u32).await {
-                    tracing::error!("Failed to write response length: {}", e);
+                    if let Err(e) = write_half.write_all(wire_frame.as_bytes()).await {
+                        tracing::error!("Failed to write response: {}", e);
+                        write_error = true;
+                        break;
+                    }
+                }
+
+                if write_error {
                     break;
                 }
 
-                if let Err(e) = write_half.write_all(wire_frame.as_bytes()).await {
-                    tracing::error!("Failed to write response: {}", e);
-                    break;
-                }
-
+                // Single flush after the entire batch
                 if let Err(e) = write_half.flush().await {
                     tracing::error!("Failed to flush: {}", e);
                     break;
+                }
+            }
+        });
+
+        // Spawn periodic stale connection cleanup task
+        let cleanup_cm = self.connection_manager.clone();
+        let cleanup_tc = self.target_connections.clone();
+        let cleanup_interval = Duration::from_secs(self.config.stale_cleanup_interval_secs);
+        let mut cleanup_shutdown = self.shutdown.subscribe();
+        let _cleanup_handle = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(cleanup_interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        let removed_ids = cleanup_cm.cleanup_stale().await;
+                        if !removed_ids.is_empty() {
+                            tracing::debug!("Stale cleanup removed {} connections from ConnectionManager", removed_ids.len());
+                            let mut tc = cleanup_tc.write().await;
+                            for id in &removed_ids {
+                                tc.remove(id);
+                            }
+                        }
+                    }
+                    _ = cleanup_shutdown.changed() => {
+                        tracing::debug!("Stale cleanup task shutting down");
+                        break;
+                    }
                 }
             }
         });
@@ -350,11 +398,12 @@ impl DestContainer {
         drop(response_tx);
         let _ = writer_handle.await;
 
-        // Clear target connections
+        // Clear target connections and connection manager
         {
             let mut connections = self.target_connections.write().await;
             connections.clear();
         }
+        self.connection_manager.close_all().await;
 
         Ok(())
     }
@@ -516,7 +565,7 @@ impl DestContainer {
                 };
 
                 let conn_result = connection_manager
-                    .create_connection(parsed_addr, protocol, port)
+                    .create_connection_with_id(connection_id, parsed_addr, protocol, port)
                     .await;
 
                 let (conn, _tx, _rx) = match conn_result {
@@ -535,9 +584,9 @@ impl DestContainer {
                     let mut connections = self.target_connections.write().await;
                     connections.insert(
                         connection_id,
-                        TargetConnection {
-                            writer: target_write,
-                        },
+                        Arc::new(TargetConnection {
+                            writer: Mutex::new(target_write),
+                        }),
                     );
                 }
 
@@ -545,6 +594,7 @@ impl DestContainer {
                 let response_tx_clone = response_tx.clone();
                 let target_connections = self.target_connections.clone();
                 let conn_clone = conn.clone();
+                let cm_clone = connection_manager.clone();
 
                 tokio::spawn(async move {
                     let mut target_read = target_read;
@@ -564,6 +614,7 @@ impl DestContainer {
                             Ok(n) => {
                                 // Forward data from target to tunnel
                                 conn_clone.record_receive(n);
+                                conn_clone.touch().await;
                                 if let Ok(data_frame) = Frame::new_data(connection_id, 0, &buf[..n])
                                 {
                                     if response_tx_clone.send(data_frame).is_err() {
@@ -585,9 +636,12 @@ impl DestContainer {
                         }
                     }
 
-                    // Clean up connection
-                    let mut connections = target_connections.write().await;
-                    connections.remove(&connection_id);
+                    // Clean up connection from both maps
+                    {
+                        let mut connections = target_connections.write().await;
+                        connections.remove(&connection_id);
+                    }
+                    cm_clone.remove_connection(connection_id).await;
                 });
 
                 metrics
@@ -603,21 +657,35 @@ impl DestContainer {
                 let payload = frame.payload();
 
                 if payload.is_empty() && frame.is_fin() {
-                    // Close indication
-                    let mut connections = self.target_connections.write().await;
-                    connections.remove(&connection_id);
+                    // Close indication - remove from both maps
+                    {
+                        let mut connections = self.target_connections.write().await;
+                        connections.remove(&connection_id);
+                    }
+                    connection_manager.remove_connection(connection_id).await;
                     return None;
                 }
 
-                // Look up target connection and forward data
-                let mut connections = self.target_connections.write().await;
-                if let Some(target_conn) = connections.get_mut(&connection_id) {
-                    if let Err(e) = target_conn.writer.write_all(payload).await {
+                // Look up target connection with a read lock, then lock per-connection Mutex
+                let target_conn = {
+                    let connections = self.target_connections.read().await;
+                    connections.get(&connection_id).cloned()
+                };
+
+                if let Some(target_conn) = target_conn {
+                    let mut writer = target_conn.writer.lock().await;
+                    if let Err(e) = writer.write_all(payload).await {
                         tracing::error!("Failed to write to target {}: {}", connection_id, e);
+                        drop(writer);
+                        let mut connections = self.target_connections.write().await;
                         connections.remove(&connection_id);
-                    } else if let Err(e) = target_conn.writer.flush().await {
+                        connection_manager.remove_connection(connection_id).await;
+                    } else if let Err(e) = writer.flush().await {
                         tracing::error!("Failed to flush target {}: {}", connection_id, e);
+                        drop(writer);
+                        let mut connections = self.target_connections.write().await;
                         connections.remove(&connection_id);
+                        connection_manager.remove_connection(connection_id).await;
                     } else {
                         metrics
                             .bytes_sent
@@ -670,6 +738,16 @@ impl DestContainer {
             tracing::warn!("Cannot handle frame: no active tunnel connection");
             Ok(None)
         }
+    }
+
+    /// Number of connections tracked by the ConnectionManager
+    pub async fn connection_count(&self) -> usize {
+        self.connection_manager.connection_count().await
+    }
+
+    /// Number of active target TCP connections
+    pub async fn target_connection_count(&self) -> usize {
+        self.target_connections.read().await.len()
     }
 
     pub async fn run(&self) -> Result<(), DestError> {

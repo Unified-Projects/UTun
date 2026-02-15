@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-02-15
+
+### Fixed
+- Critical connection leak on dest side caused by ID mismatch between ConnectionManager (auto-generated IDs) and target_connections/frame connection_id (source IDs). ConnectionManager.remove_connection() was always a no-op on the dest, causing unbounded growth until the 8000 connection limit was hit with no recovery.
+- Reader task on dest side now removes connections from both target_connections and ConnectionManager on close, preventing leaked entries.
+- FIN Data frame handler now removes connections from ConnectionManager in addition to target_connections.
+- Tunnel disconnect cleanup now calls ConnectionManager.close_all() to release all tracked connections.
+- Source demux task now removes dead channel entries from the connection registry when a send fails, preventing stale entries from accumulating.
+
+### Added
+- `ConnectionManager::create_connection_with_id()` method allowing caller-provided IDs so the dest side uses the same connection IDs as the source, eliminating the ID mismatch bug.
+- `ConnectionManager::get_connection()` for read-only connection lookups.
+- Periodic stale connection cleanup task on the dest side that runs every N seconds (configurable via `stale_cleanup_interval_secs`), reaping idle and closed connections from both ConnectionManager and target_connections.
+- `stale_cleanup_interval_secs` configuration field on DestConfig (default: 15 seconds).
+- `connection_count()` and `target_connection_count()` observability methods on DestContainer.
+- `connection_count()` and `registry_count()` observability methods on SourceContainer.
+- Unit tests for `create_connection_with_id`, `cleanup_stale` return values, and idle timeout cleanup.
+
+### Changed
+- `ConnectionManager::cleanup_stale()` now returns `Vec<u32>` (removed IDs) instead of `usize`, allowing callers to sync other data structures.
+- Dest data forwarding now uses a read lock on the target_connections HashMap with a per-connection Mutex on the writer, eliminating the global write lock that blocked all concurrent data forwarding.
+- `TargetConnection.writer` changed from `OwnedWriteHalf` to `Mutex<OwnedWriteHalf>` and stored as `Arc<TargetConnection>` to support concurrent access.
+- Dest writer task now batches pending frames via try_recv() and flushes once per batch instead of per-frame, reducing syscall overhead.
+- TCP_NODELAY now set on the tunnel socket at connection start for lower latency.
+
 ## [0.1.6] - 2026-02-14
 
 ### Fixed

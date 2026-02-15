@@ -130,6 +130,10 @@ pub struct DestConfig {
     #[serde(default)]
     pub connection_filter: ConnectionFilterConfig,
 
+    /// Interval in seconds between stale connection cleanup sweeps
+    #[serde(default = "default_stale_cleanup_interval")]
+    pub stale_cleanup_interval_secs: u64,
+
     // For backwards compatibility
     #[serde(skip)]
     pub server_cert_path: PathBuf,
@@ -392,6 +396,9 @@ fn default_circuit_breaker_window_secs() -> u64 {
 }
 fn default_circuit_breaker_max_restarts() -> usize {
     5
+}
+fn default_stale_cleanup_interval() -> u64 {
+    15
 }
 
 /// Load configuration from file

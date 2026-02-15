@@ -168,6 +168,9 @@ pub enum ConnectionError {
     #[error("Connection not found: {0}")]
     NotFound(u32),
 
+    #[error("Duplicate connection ID: {0}")]
+    DuplicateId(u32),
+
     #[error("Service not found: port {0}")]
     ServiceNotFound(u16),
 
@@ -235,12 +238,55 @@ impl ConnectionManager {
         Ok((conn, tx, rx))
     }
 
+    /// Create a connection with a caller-provided ID instead of auto-generating one.
+    /// Used by the dest side to keep IDs consistent with the source's connection_id.
+    pub async fn create_connection_with_id(
+        &self,
+        id: u32,
+        remote_addr: SocketAddr,
+        protocol: Protocol,
+        service_port: u16,
+    ) -> Result<(Arc<Connection>, mpsc::Sender<Frame>, mpsc::Receiver<Frame>), ConnectionError>
+    {
+        let mut connections = self.connections.write().await;
+
+        if connections.len() >= self.max_connections {
+            return Err(ConnectionError::LimitExceeded {
+                max: self.max_connections,
+            });
+        }
+
+        if connections.contains_key(&id) {
+            return Err(ConnectionError::DuplicateId(id));
+        }
+
+        let (conn, tx, rx) = Connection::new_with_channel_size(
+            id,
+            remote_addr,
+            protocol,
+            service_port,
+            self.channel_size,
+        );
+        let conn = Arc::new(conn);
+
+        connections.insert(id, conn.clone());
+
+        Ok((conn, tx, rx))
+    }
+
+    pub async fn get_connection(&self, id: u32) -> Option<Arc<Connection>> {
+        let connections = self.connections.read().await;
+        connections.get(&id).cloned()
+    }
+
     pub async fn remove_connection(&self, id: u32) {
         let mut connections = self.connections.write().await;
         connections.remove(&id);
     }
 
-    pub async fn cleanup_stale(&self) -> usize {
+    /// Remove stale connections (closed or idle past timeout).
+    /// Returns the IDs of removed connections so callers can sync other data structures.
+    pub async fn cleanup_stale(&self) -> Vec<u32> {
         let mut connections = self.connections.write().await;
         let mut to_remove = Vec::new();
 
@@ -257,7 +303,7 @@ impl ConnectionManager {
             connections.remove(id);
         }
 
-        to_remove.len()
+        to_remove
     }
 
     pub async fn connection_count(&self) -> usize {
@@ -325,7 +371,7 @@ mod tests {
         conn.set_state(ConnectionState::Closed).await;
 
         let removed = cm.cleanup_stale().await;
-        assert_eq!(removed, 1);
+        assert_eq!(removed.len(), 1);
         assert_eq!(cm.connection_count().await, 0);
     }
 
@@ -341,5 +387,90 @@ mod tests {
 
         conn.touch().await;
         assert!(!conn.is_idle(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_create_connection_with_id() {
+        let cm = ConnectionManager::new(100, 30000);
+
+        // Create with specific ID
+        let (conn, _, _) = cm
+            .create_connection_with_id(42, "127.0.0.1:8080".parse().unwrap(), Protocol::Tcp, 8080)
+            .await
+            .unwrap();
+        assert_eq!(conn.id(), 42);
+        assert_eq!(cm.connection_count().await, 1);
+
+        // Verify lookup works
+        let found = cm.get_connection(42).await;
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id(), 42);
+
+        // Duplicate ID should be rejected
+        let result = cm
+            .create_connection_with_id(42, "127.0.0.1:8081".parse().unwrap(), Protocol::Tcp, 8081)
+            .await;
+        assert!(matches!(result, Err(ConnectionError::DuplicateId(42))));
+
+        // Different ID should work
+        let (conn2, _, _) = cm
+            .create_connection_with_id(99, "127.0.0.1:8082".parse().unwrap(), Protocol::Tcp, 8082)
+            .await
+            .unwrap();
+        assert_eq!(conn2.id(), 99);
+        assert_eq!(cm.connection_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_returns_ids() {
+        let cm = ConnectionManager::new(10, 100);
+
+        let (conn1, _, _) = cm
+            .create_connection_with_id(10, "127.0.0.1:8080".parse().unwrap(), Protocol::Tcp, 8080)
+            .await
+            .unwrap();
+        let (conn2, _, _) = cm
+            .create_connection_with_id(20, "127.0.0.1:8081".parse().unwrap(), Protocol::Tcp, 8081)
+            .await
+            .unwrap();
+        let (_conn3, _, _) = cm
+            .create_connection_with_id(30, "127.0.0.1:8082".parse().unwrap(), Protocol::Tcp, 8082)
+            .await
+            .unwrap();
+
+        assert_eq!(cm.connection_count().await, 3);
+
+        // Mark two as closed
+        conn1.set_state(ConnectionState::Closed).await;
+        conn2.set_state(ConnectionState::Closed).await;
+
+        let mut removed = cm.cleanup_stale().await;
+        removed.sort();
+        assert_eq!(removed, vec![10, 20]);
+        assert_eq!(cm.connection_count().await, 1);
+
+        // The remaining connection should still be findable
+        let found = cm.get_connection(30).await;
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_cleanup() {
+        // Very short timeout (50ms)
+        let cm = ConnectionManager::new(10, 50);
+
+        let (_conn, _, _) = cm
+            .create_connection_with_id(1, "127.0.0.1:8080".parse().unwrap(), Protocol::Tcp, 8080)
+            .await
+            .unwrap();
+
+        assert_eq!(cm.connection_count().await, 1);
+
+        // Wait for idle timeout
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let removed = cm.cleanup_stale().await;
+        assert_eq!(removed, vec![1]);
+        assert_eq!(cm.connection_count().await, 0);
     }
 }

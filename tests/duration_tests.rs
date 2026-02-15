@@ -121,6 +121,7 @@ async fn setup_full_stack(
         target_connect_timeout_ms: 5000,
         connection_channel_size: 1024,
         connection_filter: ConnectionFilterConfig::default(),
+        stale_cleanup_interval_secs: 15,
         server_cert_path: cert_dir.join("server.crt"),
         server_key_path: cert_dir.join("server.key"),
         ca_cert_path: cert_dir.join("ca.crt"),

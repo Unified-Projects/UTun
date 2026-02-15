@@ -818,8 +818,11 @@ impl SourceContainer {
 
                                         if let Some(tx) = registry_read.get(&conn_id) {
                                             if tx.send(frame).await.is_err() {
-                                                tracing::error!("Connection {} channel closed, failed to route frame", conn_id);
-                                                // Connection dropped, will be unregistered by handle_client cleanup
+                                                tracing::debug!("Connection {} channel closed, cleaning up dead entry", conn_id);
+                                                // Drop read lock before acquiring write lock
+                                                drop(registry_read);
+                                                let mut registry_write = registry.write().await;
+                                                registry_write.remove(&conn_id);
                                             }
                                         } else {
                                             tracing::warn!("Frame for unknown connection: {}", conn_id);
@@ -1198,6 +1201,16 @@ impl SourceContainer {
         });
 
         Ok(())
+    }
+
+    /// Number of connections tracked by the ConnectionManager
+    pub async fn connection_count(&self) -> usize {
+        self.connection_manager.connection_count().await
+    }
+
+    /// Number of entries in the demux connection registry
+    pub async fn registry_count(&self) -> usize {
+        self.connection_registry.read().await.len()
     }
 
     pub async fn send_frame(&self, frame: Frame) -> Result<(), SourceError> {

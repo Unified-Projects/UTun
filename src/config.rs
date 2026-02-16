@@ -95,6 +95,13 @@ pub struct SourceConfig {
     #[serde(default)]
     pub exposed_ports: Vec<ExposedPortConfig>,
 
+    // Blue-green connection refresh
+    #[serde(default = "default_connection_refresh_interval")]
+    pub connection_refresh_interval_secs: u64, // 0 = disabled
+
+    #[serde(default = "default_connection_drain_timeout")]
+    pub connection_drain_timeout_secs: u64,
+
     // For backwards compatibility
     #[serde(skip)]
     pub client_cert_path: PathBuf,
@@ -399,6 +406,12 @@ fn default_circuit_breaker_max_restarts() -> usize {
 }
 fn default_stale_cleanup_interval() -> u64 {
     15
+}
+fn default_connection_refresh_interval() -> u64 {
+    3600
+} // 1 hour
+fn default_connection_drain_timeout() -> u64 {
+    60
 }
 
 /// Load configuration from file

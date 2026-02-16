@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -126,14 +126,13 @@ impl ListenerManager {
     }
 }
 
-/// Tracks heartbeat state for ping/pong exchanges
 struct HeartbeatState {
     last_activity: Arc<RwLock<Instant>>,
     last_ping_seq: Arc<RwLock<Option<u32>>>,
     last_ping_time: Arc<RwLock<Option<Instant>>>,
     consecutive_misses: Arc<RwLock<u8>>,
     rtt_avg_us: Arc<RwLock<Option<u64>>>,
-    pong_received: Arc<AtomicBool>, // Atomic flag for race-free pong detection
+    pong_received: Arc<AtomicBool>,
 }
 
 impl HeartbeatState {
@@ -146,6 +145,15 @@ impl HeartbeatState {
             rtt_avg_us: Arc::new(RwLock::new(None)),
             pong_received: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    async fn reset(&self) {
+        *self.last_activity.write().await = Instant::now();
+        *self.last_ping_seq.write().await = None;
+        *self.last_ping_time.write().await = None;
+        *self.consecutive_misses.write().await = 0;
+        *self.rtt_avg_us.write().await = None;
+        self.pong_received.store(false, Ordering::SeqCst);
     }
 
     async fn record_activity(&self) {
@@ -170,7 +178,7 @@ impl HeartbeatState {
                 let rtt = sent_time.elapsed();
                 let rtt_us = rtt.as_micros() as u64;
 
-                // Exponential moving average: new = 0.2 * current + 0.8 * old
+                // EMA: 0.2 * current + 0.8 * old
                 let mut avg = self.rtt_avg_us.write().await;
                 *avg = Some(match *avg {
                     Some(old) => (rtt_us * 2 + old * 8) / 10,
@@ -196,7 +204,6 @@ impl HeartbeatState {
     }
 }
 
-/// Manages automatic reconnection with exponential backoff
 pub struct ReconnectionManager {
     attempt: AtomicU32,
     last_delay_ms: Arc<RwLock<u64>>,
@@ -214,12 +221,11 @@ impl ReconnectionManager {
         }
     }
 
-    /// Calculate next backoff delay using decorrelated jitter
     async fn calculate_backoff(&self) -> Duration {
         let attempt = self.attempt.load(Ordering::SeqCst);
 
         if attempt == 0 {
-            return Duration::from_millis(0); // First retry immediate
+            return Duration::from_millis(0);
         }
 
         if attempt == 1 {
@@ -230,7 +236,7 @@ impl ReconnectionManager {
         let base = self.config.initial_reconnect_delay_ms;
         let max = self.config.max_reconnect_delay_ms;
 
-        // Decorrelated jitter: random_between(base, last * 3)
+        // Decorrelated jitter
         let upper = std::cmp::min(max, last * 3);
         let delay = if upper > base {
             use rand::Rng;
@@ -244,7 +250,6 @@ impl ReconnectionManager {
         Duration::from_millis(delay)
     }
 
-    /// Attempt reconnection with backoff
     pub async fn reconnect<F, Fut>(&self, connect_fn: F) -> Result<(), SourceError>
     where
         F: Fn() -> Fut,
@@ -255,7 +260,6 @@ impl ReconnectionManager {
         loop {
             let attempt = self.attempt.fetch_add(1, Ordering::SeqCst);
 
-            // Check if max attempts exceeded
             if max_attempts > 0 && attempt >= max_attempts {
                 tracing::error!("Max reconnection attempts ({}) exceeded", max_attempts);
                 self.health_monitor
@@ -266,7 +270,6 @@ impl ReconnectionManager {
                 ));
             }
 
-            // Calculate and apply backoff
             let delay = self.calculate_backoff().await;
             if !delay.is_zero() {
                 tracing::info!("Reconnection attempt {} after {:?}", attempt + 1, delay);
@@ -276,7 +279,6 @@ impl ReconnectionManager {
                 tokio::time::sleep(delay).await;
             }
 
-            // Attempt connection
             match connect_fn().await {
                 Ok(_) => {
                     tracing::info!("Reconnection successful after {} attempts", attempt + 1);
@@ -288,7 +290,7 @@ impl ReconnectionManager {
                     tracing::warn!("Reconnection attempt {} failed: {}", attempt + 1, e);
                     self.health_monitor.record_error().await;
 
-                    // Circuit breaker: extended backoff after 10 failures
+                    // Extended backoff after 10 failures
                     if attempt >= 10 {
                         tracing::warn!("Circuit breaker activated, using extended backoff");
                         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -308,38 +310,42 @@ impl ReconnectionManager {
     }
 }
 
-pub struct SourceContainer {
-    config: SourceConfig,
-    key_manager: Arc<KeyManager>,
-    connection_manager: Arc<ConnectionManager>,
-    frame_codec: Arc<RwLock<Option<Arc<FrameCodec>>>>,
-    tunnel_stream: Arc<RwLock<Option<TcpStream>>>, // Used only during handshake
-    tunnel_read: Arc<Mutex<Option<OwnedReadHalf>>>, // For demux task
-    tunnel_write: Arc<Mutex<Option<OwnedWriteHalf>>>, // For sending frames
-    shutdown: watch::Sender<bool>,
-    metrics: Arc<SourceMetrics>,
-    health_monitor: Arc<HealthMonitor>,
-    /// Maximum handshake message size (depends on KEM mode)
-    max_handshake_size: u32,
-    heartbeat_state: Arc<HeartbeatState>,
-    ping_sequence: Arc<AtomicU32>,
-    /// Registry mapping connection_id to tx_from_tunnel for frame demultiplexing
-    connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>>,
-    /// Write queue for lock-free frame sending
-    write_queue_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Frame>>>>,
-    /// Demux task handle for monitoring
-    demux_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Resilience components
-    tunnel_metrics: Arc<super::resilience::TunnelMetrics>,
-    circuit_breaker: Arc<super::resilience::CircuitBreaker>,
-    demux_watchdog: Arc<super::resilience::DemuxWatchdog>,
-    /// Flag to trigger reconnection
-    reconnection_needed: Arc<AtomicBool>,
+#[derive(Debug)]
+enum TunnelRecoverySignal {
+    HeartbeatDead { session_id: u64 },
+    DemuxExited { session_id: u64 },
+    WriterExited { session_id: u64 },
 }
 
-/// Helper function to create TcpListener with SO_REUSEADDR and SO_REUSEPORT enabled
-/// If bind fails, retries with up to 5 incremented ports
-/// Returns (TcpListener, actual_port_bound)
+impl TunnelRecoverySignal {
+    fn session_id(&self) -> u64 {
+        match self {
+            TunnelRecoverySignal::HeartbeatDead { session_id } => *session_id,
+            TunnelRecoverySignal::DemuxExited { session_id } => *session_id,
+            TunnelRecoverySignal::WriterExited { session_id } => *session_id,
+        }
+    }
+}
+
+struct TunnelSession {
+    session_id: u64,
+    frame_codec: Arc<FrameCodec>,
+    write_queue_tx: mpsc::UnboundedSender<Frame>,
+    connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>>,
+    heartbeat_state: Arc<HeartbeatState>,
+    session_shutdown: watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for TunnelSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelSession")
+            .field("session_id", &self.session_id)
+            .field("registry_len", &"<async>")
+            .finish()
+    }
+}
+
+/// Bind a TcpListener with SO_REUSEADDR/SO_REUSEPORT, falling back to +5 ports if busy.
 async fn bind_with_reuse(addr: &str) -> std::io::Result<(TcpListener, u16)> {
     let mut socket_addr: SocketAddr = addr
         .parse()
@@ -348,7 +354,6 @@ async fn bind_with_reuse(addr: &str) -> std::io::Result<(TcpListener, u16)> {
     let original_port = socket_addr.port();
     let mut last_error = None;
 
-    // Try original port + up to 5 fallback ports
     for attempt in 0..6 {
         let current_port = original_port + attempt;
 
@@ -394,13 +399,30 @@ async fn bind_with_reuse(addr: &str) -> std::io::Result<(TcpListener, u16)> {
         }
     }
 
-    // All attempts failed
     Err(last_error.unwrap_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             "All fallback ports exhausted",
         )
     }))
+}
+
+pub struct SourceContainer {
+    config: SourceConfig,
+    key_manager: Arc<KeyManager>,
+    connection_manager: Arc<ConnectionManager>,
+    shutdown: watch::Sender<bool>,
+    metrics: Arc<SourceMetrics>,
+    health_monitor: Arc<HealthMonitor>,
+    max_handshake_size: u32,
+    ping_sequence: Arc<AtomicU32>,
+    tunnel_metrics: Arc<super::resilience::TunnelMetrics>,
+    circuit_breaker: Arc<super::resilience::CircuitBreaker>,
+    active_session: Arc<RwLock<Option<Arc<TunnelSession>>>>,
+    retiring_sessions: Arc<Mutex<Vec<Arc<TunnelSession>>>>,
+    recovery_tx: mpsc::UnboundedSender<TunnelRecoverySignal>,
+    recovery_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<TunnelRecoverySignal>>>>,
+    session_counter: Arc<AtomicU64>,
 }
 
 impl SourceContainer {
@@ -418,58 +440,56 @@ impl SourceContainer {
         let (shutdown_tx, _) = watch::channel(false);
 
         let health_monitor = Arc::new(HealthMonitor::new());
-        // Set initial status to Starting
         health_monitor.set_status(HealthStatus::Starting).await;
 
         let max_handshake_size = crypto_config.effective_max_handshake_size();
 
-        // Initialize resilience components
         let tunnel_metrics = Arc::new(super::resilience::TunnelMetrics::new());
         let circuit_breaker = Arc::new(super::resilience::CircuitBreaker::new(
             Duration::from_secs(config.circuit_breaker_window_secs),
             config.circuit_breaker_max_restarts,
         ));
-        let demux_watchdog = Arc::new(super::resilience::DemuxWatchdog::new(
-            circuit_breaker.clone(),
-            tunnel_metrics.clone(),
-        ));
+
+        let (recovery_tx, recovery_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config,
             key_manager,
             connection_manager,
-            frame_codec: Arc::new(RwLock::new(None)),
-            tunnel_stream: Arc::new(RwLock::new(None)),
-            tunnel_read: Arc::new(Mutex::new(None)),
-            tunnel_write: Arc::new(Mutex::new(None)),
             shutdown: shutdown_tx,
             metrics: Arc::new(SourceMetrics::new()),
             health_monitor,
             max_handshake_size,
-            heartbeat_state: Arc::new(HeartbeatState::new()),
             ping_sequence: Arc::new(AtomicU32::new(0)),
-            connection_registry: Arc::new(RwLock::new(HashMap::new())),
-            write_queue_tx: Arc::new(RwLock::new(None)),
-            demux_handle: Arc::new(RwLock::new(None)),
             tunnel_metrics,
             circuit_breaker,
-            demux_watchdog,
-            reconnection_needed: Arc::new(AtomicBool::new(false)),
+            active_session: Arc::new(RwLock::new(None)),
+            retiring_sessions: Arc::new(Mutex::new(Vec::new())),
+            recovery_tx,
+            recovery_rx: Arc::new(Mutex::new(Some(recovery_rx))),
+            session_counter: Arc::new(AtomicU64::new(1)),
         })
     }
 
     pub async fn start(&self) -> Result<(), SourceError> {
         if self.config.reconnection_enabled {
-            // Connect with reconnection (includes handshake and heartbeat)
-            self.connect_to_dest().await?;
-        } else {
-            // Original flow without reconnection
-            self.connect_to_dest().await?;
-            self.perform_handshake().await?;
-            self.spawn_heartbeat_task().await?;
-        }
+            let reconnection_manager =
+                ReconnectionManager::new(self.config.clone(), self.health_monitor.clone());
 
-        Ok(())
+            reconnection_manager
+                .reconnect(|| async {
+                    let session = self.establish_session().await?;
+                    let mut active = self.active_session.write().await;
+                    *active = Some(session);
+                    Ok(())
+                })
+                .await
+        } else {
+            let session = self.establish_session().await?;
+            let mut active = self.active_session.write().await;
+            *active = Some(session);
+            Ok(())
+        }
     }
 
     pub async fn setup_listeners(&self) -> Result<Vec<PortListener>, SourceError> {
@@ -554,6 +574,18 @@ impl SourceContainer {
     pub async fn stop(&self) {
         tracing::info!("Stopping source container");
         let _ = self.shutdown.send(true);
+
+        if let Some(session) = self.active_session.write().await.take() {
+            self.teardown_session(&session).await;
+        }
+
+        {
+            let mut retiring = self.retiring_sessions.lock().await;
+            for session in retiring.drain(..) {
+                self.teardown_session(&session).await;
+            }
+        }
+
         self.connection_manager.close_all().await;
     }
 
@@ -566,43 +598,26 @@ impl SourceContainer {
         self.health_monitor.clone()
     }
 
-    pub async fn connect_to_dest(&self) -> Result<(), SourceError> {
-        if !self.config.reconnection_enabled {
-            // Original single-attempt logic
-            return self.connect_to_dest_once().await;
-        }
-
-        let reconnection_manager =
-            ReconnectionManager::new(self.config.clone(), self.health_monitor.clone());
-
-        reconnection_manager
-            .reconnect(|| async {
-                self.connect_to_dest_once().await?;
-                self.perform_handshake().await?;
-                self.spawn_heartbeat_task().await?;
-                Ok(())
-            })
-            .await
+    async fn establish_session(&self) -> Result<Arc<TunnelSession>, SourceError> {
+        let stream = self.connect_tcp().await?;
+        let (codec, read_half, write_half) = self.perform_handshake_on(stream).await?;
+        let session = self.create_session(codec, read_half, write_half);
+        Ok(session)
     }
 
-    async fn connect_to_dest_once(&self) -> Result<(), SourceError> {
+    async fn connect_tcp(&self) -> Result<TcpStream, SourceError> {
         let dest_addr = format!("{}:{}", self.config.dest_host, self.config.dest_tunnel_port);
-
-        // Set status to Connecting
         self.health_monitor
             .set_status(HealthStatus::Connecting)
             .await;
-
         let stream = TcpStream::connect(&dest_addr).await?;
-
-        let mut tunnel_stream = self.tunnel_stream.write().await;
-        *tunnel_stream = Some(stream);
-
-        Ok(())
+        Ok(stream)
     }
 
-    pub async fn perform_handshake(&self) -> Result<(), SourceError> {
-        // Validate certificate access before attempting to read
+    async fn perform_handshake_on(
+        &self,
+        mut stream: TcpStream,
+    ) -> Result<(Arc<FrameCodec>, OwnedReadHalf, OwnedWriteHalf), SourceError> {
         use crate::crypto::file_access::validate_file_access;
         validate_file_access(
             &self.config.client_cert_path,
@@ -611,7 +626,6 @@ impl SourceContainer {
         )
         .map_err(|e| SourceError::ConfigError(e.to_string()))?;
 
-        // Load certificates
         let client_cert = std::fs::read(&self.config.client_cert_path)
             .map_err(|e| SourceError::ConfigError(format!("Failed to read client cert: {}", e)))?;
         let client_key = std::fs::read(&self.config.client_key_path)
@@ -626,109 +640,83 @@ impl SourceContainer {
             ca_cert,
         );
 
-        // Send ClientHello
         let client_hello = handshake_ctx
             .create_client_hello()
             .map_err(SourceError::HandshakeError)?;
         let hello_bytes = bincode::serialize(&client_hello)
             .map_err(|e| SourceError::ConfigError(format!("Serialization failed: {}", e)))?;
 
-        {
-            let mut tunnel_stream = self.tunnel_stream.write().await;
-            let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
+        stream.write_u32(hello_bytes.len() as u32).await?;
+        stream.write_all(&hello_bytes).await?;
+        stream.flush().await?;
 
-            stream.write_u32(hello_bytes.len() as u32).await?;
-            stream.write_all(&hello_bytes).await?;
-            stream.flush().await?;
-        }
-
-        // Receive ServerHello with size validation and timeout
-        let server_hello_bytes = {
-            let mut tunnel_stream = self.tunnel_stream.write().await;
-            let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
-
-            let len = match timeout(HANDSHAKE_TIMEOUT, stream.read_u32()).await {
-                Ok(Ok(l)) => l,
-                Ok(Err(e)) => return Err(SourceError::IoError(e)),
-                Err(_) => return Err(SourceError::Timeout),
-            };
-
-            if len > self.max_handshake_size {
-                return Err(SourceError::FrameTooLarge {
-                    size: len,
-                    max: self.max_handshake_size,
-                });
-            }
-
-            let mut buf = vec![0u8; len as usize];
-            match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(SourceError::IoError(e)),
-                Err(_) => return Err(SourceError::Timeout),
-            }
-            buf
+        // ServerHello
+        let len = match timeout(HANDSHAKE_TIMEOUT, stream.read_u32()).await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => return Err(SourceError::IoError(e)),
+            Err(_) => return Err(SourceError::Timeout),
         };
 
-        let server_hello = bincode::deserialize(&server_hello_bytes)
+        if len > self.max_handshake_size {
+            return Err(SourceError::FrameTooLarge {
+                size: len,
+                max: self.max_handshake_size,
+            });
+        }
+
+        let mut buf = vec![0u8; len as usize];
+        match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(SourceError::IoError(e)),
+            Err(_) => return Err(SourceError::Timeout),
+        }
+
+        let server_hello = bincode::deserialize(&buf)
             .map_err(|e| SourceError::ConfigError(format!("Deserialization failed: {}", e)))?;
 
         let client_finished = handshake_ctx.process_server_hello(server_hello).await?;
 
-        // Send ClientFinished
         let finished_bytes = bincode::serialize(&client_finished)
             .map_err(|e| SourceError::ConfigError(format!("Serialization failed: {}", e)))?;
 
-        {
-            let mut tunnel_stream = self.tunnel_stream.write().await;
-            let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
+        stream.write_u32(finished_bytes.len() as u32).await?;
+        stream.write_all(&finished_bytes).await?;
+        stream.flush().await?;
 
-            stream.write_u32(finished_bytes.len() as u32).await?;
-            stream.write_all(&finished_bytes).await?;
-            stream.flush().await?;
-        }
-
-        // Receive ServerFinished with size validation and timeout
-        let server_finished_bytes = {
-            let mut tunnel_stream = self.tunnel_stream.write().await;
-            let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
-
-            let len = match timeout(HANDSHAKE_TIMEOUT, stream.read_u32()).await {
-                Ok(Ok(l)) => l,
-                Ok(Err(e)) => return Err(SourceError::IoError(e)),
-                Err(_) => return Err(SourceError::Timeout),
-            };
-
-            if len > self.max_handshake_size {
-                return Err(SourceError::FrameTooLarge {
-                    size: len,
-                    max: self.max_handshake_size,
-                });
-            }
-
-            let mut buf = vec![0u8; len as usize];
-            match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(SourceError::IoError(e)),
-                Err(_) => return Err(SourceError::Timeout),
-            }
-            buf
+        // ServerFinished
+        let len = match timeout(HANDSHAKE_TIMEOUT, stream.read_u32()).await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => return Err(SourceError::IoError(e)),
+            Err(_) => return Err(SourceError::Timeout),
         };
 
-        let server_finished = bincode::deserialize(&server_finished_bytes)
+        if len > self.max_handshake_size {
+            return Err(SourceError::FrameTooLarge {
+                size: len,
+                max: self.max_handshake_size,
+            });
+        }
+
+        let mut buf = vec![0u8; len as usize];
+        match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(SourceError::IoError(e)),
+            Err(_) => return Err(SourceError::Timeout),
+        }
+
+        let server_finished = bincode::deserialize(&buf)
             .map_err(|e| SourceError::ConfigError(format!("Deserialization failed: {}", e)))?;
 
         handshake_ctx
             .process_server_finished(server_finished)
             .await?;
 
-        // Get session key and initialize crypto
         let session_key = handshake_ctx
             .get_session_key()
             .ok_or(SourceError::ConfigError(
                 "Failed to derive session key".to_string(),
             ))?;
 
-        // Use proper HKDF to derive separate encryption and MAC keys
         use hkdf::Hkdf;
         use sha2::Sha256;
 
@@ -747,201 +735,92 @@ impl SourceContainer {
         let session_crypto = SessionCrypto::from_key_material(&derived_key);
         let frame_codec = Arc::new(FrameCodec::new(Arc::new(session_crypto)));
 
-        let mut codec = self.frame_codec.write().await;
-        *codec = Some(frame_codec);
-
-        // Mark tunnel as established and set status to Healthy
         self.health_monitor.mark_tunnel_established();
         self.health_monitor.set_status(HealthStatus::Healthy).await;
         self.health_monitor.record_success().await;
 
-        // Split tunnel stream into read/write halves to avoid lock contention
-        {
-            let mut tunnel_stream_guard = self.tunnel_stream.write().await;
-            if let Some(stream) = tunnel_stream_guard.take() {
-                let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = stream.into_split();
 
-                let mut tunnel_read = self.tunnel_read.lock().await;
-                *tunnel_read = Some(read_half);
-
-                let mut tunnel_write = self.tunnel_write.lock().await;
-                *tunnel_write = Some(write_half);
-            }
-        }
-
-        // Spawn demux task after handshake completes
-        self.spawn_demux_task().await;
-
-        // Spawn write queue task for lock-free writes
-        self.spawn_writer_task().await;
-
-        Ok(())
+        Ok((frame_codec, read_half, write_half))
     }
 
-    /// Spawns background task to demultiplex incoming frames to the correct connection handlers
-    async fn spawn_demux_task(&self) {
-        let registry = self.connection_registry.clone();
-        let frame_codec = self.frame_codec.clone();
-        let heartbeat_state = self.heartbeat_state.clone();
-        let health_monitor = self.health_monitor.clone();
-        let mut shutdown = self.shutdown.subscribe();
+    fn create_session(
+        &self,
+        frame_codec: Arc<FrameCodec>,
+        read_half: OwnedReadHalf,
+        write_half: OwnedWriteHalf,
+    ) -> Arc<TunnelSession> {
+        let session_id = self.session_counter.fetch_add(1, Ordering::SeqCst);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+        let heartbeat_state = Arc::new(HeartbeatState::new());
+        let connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
-        // Take ownership of read half for lock-free operation
-        let mut tunnel_read_owned = {
-            let mut guard = self.tunnel_read.lock().await;
-            guard.take()
-        };
+        let (write_queue_tx, write_queue_rx) = mpsc::unbounded_channel::<Frame>();
 
-        let handle = tokio::spawn(async move {
-            let mut read_half = match tunnel_read_owned.take() {
-                Some(r) => r,
-                None => {
-                    tracing::error!("Demux: no tunnel read half available");
-                    return;
-                }
-            };
-            loop {
-                tokio::select! {
-                    _ = shutdown.changed() => {
-                        break;
-                    }
-                    frame_result = Self::read_frame_static(&frame_codec, &mut read_half, &heartbeat_state, &health_monitor) => {
-                        match frame_result {
-                            Ok(frame) => {
-                                let frame_type = frame.frame_type();
-                                let conn_id = frame.connection_id();
+        Self::spawn_writer_for_session(
+            session_id,
+            frame_codec.clone(),
+            self.tunnel_metrics.clone(),
+            self.recovery_tx.clone(),
+            session_shutdown_rx.clone(),
+            write_half,
+            write_queue_rx,
+        );
 
-                                match frame_type {
-                                    FrameType::Data | FrameType::ConnectAck => {
-                                        // Route to connection by connection_id
-                                        let registry_read = registry.read().await;
-
-                                        if let Some(tx) = registry_read.get(&conn_id) {
-                                            if tx.send(frame).await.is_err() {
-                                                tracing::debug!("Connection {} channel closed, cleaning up dead entry", conn_id);
-                                                // Drop read lock before acquiring write lock
-                                                drop(registry_read);
-                                                let mut registry_write = registry.write().await;
-                                                registry_write.remove(&conn_id);
-                                            }
-                                        } else {
-                                            tracing::warn!("Frame for unknown connection: {}", conn_id);
-                                        }
-                                    }
-                                    FrameType::Pong => {
-                                        // Already handled in read_frame_static
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Demux failed to read frame: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+        let session = Arc::new(TunnelSession {
+            session_id,
+            frame_codec: frame_codec.clone(),
+            write_queue_tx,
+            connection_registry: connection_registry.clone(),
+            heartbeat_state: heartbeat_state.clone(),
+            session_shutdown: session_shutdown_tx,
         });
 
-        // Store handle and register with watchdog
-        let mut demux_handle_guard = self.demux_handle.write().await;
-        *demux_handle_guard = Some(handle);
-        drop(demux_handle_guard);
+        Self::spawn_demux_for_session(
+            session_id,
+            connection_registry,
+            frame_codec,
+            heartbeat_state.clone(),
+            self.health_monitor.clone(),
+            self.recovery_tx.clone(),
+            session_shutdown_rx.clone(),
+            read_half,
+        );
 
-        // Demux task spawned successfully
-        tracing::info!("Demux task spawned and ready for watchdog monitoring");
+        Self::spawn_heartbeat_for_session(
+            session_id,
+            session.write_queue_tx.clone(),
+            heartbeat_state,
+            self.health_monitor.clone(),
+            self.ping_sequence.clone(),
+            self.tunnel_metrics.clone(),
+            self.recovery_tx.clone(),
+            session_shutdown_rx,
+            Duration::from_millis(self.config.heartbeat_interval_ms),
+            Duration::from_millis(self.config.heartbeat_timeout_ms),
+            self.config.max_missed_pongs,
+        );
+
+        tracing::info!(
+            "Session {} established with demux/writer/heartbeat tasks",
+            session_id
+        );
+        session
     }
 
-    /// Spawns dedicated writer task for lock-free frame sending
-    async fn spawn_writer_task(&self) {
-        let (write_queue_tx, mut write_queue_rx) = mpsc::unbounded_channel::<Frame>();
-
-        // Store the sender
-        {
-            let mut tx_guard = self.write_queue_tx.write().await;
-            *tx_guard = Some(write_queue_tx);
-        }
-
-        let tunnel_write = self.tunnel_write.clone();
-        let frame_codec = self.frame_codec.clone();
-        let mut shutdown = self.shutdown.subscribe();
-        let metrics = self.tunnel_metrics.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown.changed() => {
-                        tracing::info!("Writer task shutting down");
-                        break;
-                    }
-                    Some(frame) = write_queue_rx.recv() => {
-                        // Encode frame
-                        let codec_guard = frame_codec.read().await;
-                        let codec = match codec_guard.as_ref() {
-                            Some(c) => c,
-                            None => {
-                                tracing::error!("Writer: no codec available");
-                                continue;
-                            }
-                        };
-
-                        let wire_frame = match codec.encode(&frame) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                tracing::error!("Writer: failed to encode frame: {}", e);
-                                continue;
-                            }
-                        };
-                        drop(codec_guard);
-
-                        // Acquire lock ONLY for write/flush (minimal critical section)
-                        let lock_start = Instant::now();
-                        let mut tunnel_write_guard = tunnel_write.lock().await;
-                        metrics.record_lock_wait(lock_start.elapsed());
-
-                        if let Some(stream) = tunnel_write_guard.as_mut() {
-                            if let Err(e) = stream.write_u32(wire_frame.len() as u32).await {
-                                tracing::error!("Writer: failed to write length: {}", e);
-                                break;
-                            }
-                            if let Err(e) = stream.write_all(wire_frame.as_bytes()).await {
-                                tracing::error!("Writer: failed to write data: {}", e);
-                                break;
-                            }
-                            if let Err(e) = stream.flush().await {
-                                tracing::error!("Writer: failed to flush: {}", e);
-                                break;
-                            }
-                        } else {
-                            tracing::error!("Writer: no tunnel write half available");
-                            break;
-                        }
-                        // Lock released here
-                    }
-                }
-            }
-            tracing::warn!("Writer task exited");
-        });
-
-        tracing::info!("Writer task spawned for lock-free frame sending");
-    }
-
-    /// Static version of receive_frame for use in demux task
-    async fn read_frame_static(
-        frame_codec: &Arc<RwLock<Option<Arc<FrameCodec>>>>,
+    async fn read_frame_for_session(
+        frame_codec: &FrameCodec,
         stream: &mut OwnedReadHalf,
-        heartbeat_state: &Arc<HeartbeatState>,
-        health_monitor: &Arc<HealthMonitor>,
+        heartbeat_state: &HeartbeatState,
+        health_monitor: &HealthMonitor,
     ) -> Result<Frame, SourceError> {
-        // Read frame length with timeout
         let len = match timeout(FRAME_READ_TIMEOUT, stream.read_u32()).await {
             Ok(Ok(l)) => l,
             Ok(Err(e)) => return Err(SourceError::IoError(e)),
             Err(_) => return Err(SourceError::Timeout),
         };
 
-        // Validate frame size before allocation
         if len > MAX_FRAME_SIZE {
             return Err(SourceError::FrameTooLarge {
                 size: len,
@@ -956,16 +835,11 @@ impl SourceContainer {
             Err(_) => return Err(SourceError::Timeout),
         }
 
-        let codec_guard = frame_codec.read().await;
-        let codec = codec_guard.as_ref().ok_or(SourceError::NotConnected)?;
-
         let wire_frame = super::WireFrame::new(buf);
-        let frame = codec.decode(&wire_frame)?;
+        let frame = frame_codec.decode(&wire_frame)?;
 
-        // Handle Pong frames for heartbeat
         if frame.frame_type() == FrameType::Pong {
             let seq = frame.sequence();
-            // Set atomic flag FIRST to avoid race with timeout check
             heartbeat_state.pong_received.store(true, Ordering::SeqCst);
             if let Some(rtt) = heartbeat_state.record_pong_received(seq).await {
                 tracing::debug!("Received pong (seq={}) RTT: {:?}", seq, rtt);
@@ -976,31 +850,138 @@ impl SourceContainer {
         Ok(frame)
     }
 
-    /// Register a connection for frame demultiplexing
-    async fn register_connection(&self, id: u32, tx: mpsc::Sender<Frame>) {
-        let mut registry = self.connection_registry.write().await;
-        registry.insert(id, tx);
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_demux_for_session(
+        session_id: u64,
+        registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>>,
+        frame_codec: Arc<FrameCodec>,
+        heartbeat_state: Arc<HeartbeatState>,
+        health_monitor: Arc<HealthMonitor>,
+        recovery_tx: mpsc::UnboundedSender<TunnelRecoverySignal>,
+        mut session_shutdown_rx: watch::Receiver<bool>,
+        mut read_half: OwnedReadHalf,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = session_shutdown_rx.changed() => {
+                        tracing::info!("Session {}: demux shutting down", session_id);
+                        break;
+                    }
+                    frame_result = SourceContainer::read_frame_for_session(
+                        &frame_codec, &mut read_half, &heartbeat_state, &health_monitor
+                    ) => {
+                        match frame_result {
+                            Ok(frame) => {
+                                let frame_type = frame.frame_type();
+                                let conn_id = frame.connection_id();
+
+                                match frame_type {
+                                    FrameType::Data | FrameType::ConnectAck => {
+                                        let registry_read = registry.read().await;
+
+                                        if let Some(tx) = registry_read.get(&conn_id) {
+                                            if tx.send(frame).await.is_err() {
+                                                tracing::debug!(
+                                                    "Session {}: connection {} channel closed, removing",
+                                                    session_id, conn_id
+                                                );
+                                                drop(registry_read);
+                                                let mut registry_write = registry.write().await;
+                                                registry_write.remove(&conn_id);
+                                            }
+                                        } else {
+                                            tracing::warn!(
+                                                "Session {}: frame for unknown connection: {}",
+                                                session_id, conn_id
+                                            );
+                                        }
+                                    }
+                                    FrameType::Pong => {}
+
+                                    _ => {}
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Session {}: demux read error: {}", session_id, e);
+                                let _ = recovery_tx.send(TunnelRecoverySignal::DemuxExited { session_id });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::warn!("Session {}: demux task exited", session_id);
+        });
+
+        tracing::info!("Session {}: demux task spawned", session_id);
     }
 
-    /// Unregister a connection from frame demultiplexing
-    async fn unregister_connection(&self, id: u32) {
-        let mut registry = self.connection_registry.write().await;
-        registry.remove(&id);
+    fn spawn_writer_for_session(
+        session_id: u64,
+        frame_codec: Arc<FrameCodec>,
+        tunnel_metrics: Arc<super::resilience::TunnelMetrics>,
+        recovery_tx: mpsc::UnboundedSender<TunnelRecoverySignal>,
+        mut session_shutdown_rx: watch::Receiver<bool>,
+        mut write_half: OwnedWriteHalf,
+        mut write_queue_rx: mpsc::UnboundedReceiver<Frame>,
+    ) {
+        let _ = &tunnel_metrics;
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = session_shutdown_rx.changed() => {
+                        tracing::info!("Session {}: writer shutting down", session_id);
+                        break;
+                    }
+                    Some(frame) = write_queue_rx.recv() => {
+                        let wire_frame = match frame_codec.encode(&frame) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                tracing::error!("Session {}: encode error: {}", session_id, e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = write_half.write_u32(wire_frame.len() as u32).await {
+                            tracing::error!("Session {}: write length error: {}", session_id, e);
+                            let _ = recovery_tx.send(TunnelRecoverySignal::WriterExited { session_id });
+                            break;
+                        }
+                        if let Err(e) = write_half.write_all(wire_frame.as_bytes()).await {
+                            tracing::error!("Session {}: write data error: {}", session_id, e);
+                            let _ = recovery_tx.send(TunnelRecoverySignal::WriterExited { session_id });
+                            break;
+                        }
+                        if let Err(e) = write_half.flush().await {
+                            tracing::error!("Session {}: flush error: {}", session_id, e);
+                            let _ = recovery_tx.send(TunnelRecoverySignal::WriterExited { session_id });
+                            break;
+                        }
+                    }
+                }
+            }
+            tracing::warn!("Session {}: writer task exited", session_id);
+        });
+
+        tracing::info!("Session {}: writer task spawned", session_id);
     }
 
-    /// Spawns background task to send periodic heartbeat pings
-    async fn spawn_heartbeat_task(&self) -> Result<(), SourceError> {
-        let interval = Duration::from_millis(self.config.heartbeat_interval_ms);
-        let timeout_duration = Duration::from_millis(self.config.heartbeat_timeout_ms);
-        let max_missed = self.config.max_missed_pongs;
-        let reconnection_enabled = self.config.reconnection_enabled;
-
-        let state = self.heartbeat_state.clone();
-        let container = Arc::new(self.clone());
-        let health = self.health_monitor.clone();
-        let ping_seq = self.ping_sequence.clone();
-        let mut shutdown = self.shutdown.subscribe();
-
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_heartbeat_for_session(
+        session_id: u64,
+        write_queue_tx: mpsc::UnboundedSender<Frame>,
+        heartbeat_state: Arc<HeartbeatState>,
+        health_monitor: Arc<HealthMonitor>,
+        ping_sequence: Arc<AtomicU32>,
+        tunnel_metrics: Arc<super::resilience::TunnelMetrics>,
+        recovery_tx: mpsc::UnboundedSender<TunnelRecoverySignal>,
+        mut session_shutdown_rx: watch::Receiver<bool>,
+        interval: Duration,
+        timeout_duration: Duration,
+        max_missed: u8,
+    ) {
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1008,58 +989,131 @@ impl SourceContainer {
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
-                        // Only send ping if idle for interval duration
-                        if state.should_send_ping(interval.as_millis() as u64).await {
-                            let seq = ping_seq.fetch_add(1, Ordering::SeqCst);
+                        if heartbeat_state.should_send_ping(interval.as_millis() as u64).await {
+                            let seq = ping_sequence.fetch_add(1, Ordering::SeqCst);
                             let ping = Frame::new_ping(seq);
 
-                            tracing::debug!("Sending heartbeat ping (seq={})", seq);
+                            tracing::debug!("Session {}: sending heartbeat ping (seq={})", session_id, seq);
 
-                            // Clear pong flag BEFORE sending ping (fixes race condition)
-                            state.pong_received.store(false, Ordering::SeqCst);
+                            // Clear before send to avoid pong/timeout race
+                            heartbeat_state.pong_received.store(false, Ordering::SeqCst);
 
-                            match container.send_frame(ping).await {
-                                Ok(_) => {
-                                    state.record_ping_sent(seq).await;
+                            if write_queue_tx.send(ping).is_err() {
+                                tracing::error!(
+                                    "Session {}: heartbeat send failed (queue closed)",
+                                    session_id
+                                );
+                                let _ = recovery_tx.send(TunnelRecoverySignal::HeartbeatDead { session_id });
+                                break;
+                            }
 
-                                    // Wait for pong (processed in read_frame_static)
-                                    tokio::time::sleep(timeout_duration).await;
+                            heartbeat_state.record_ping_sent(seq).await;
 
-                                    // Check if pong was received atomically
-                                    if !state.pong_received.load(Ordering::SeqCst) {
-                                        let total = state.record_ping_timeout().await;
-                                        tracing::warn!("Heartbeat timeout (seq={}), consecutive misses: {}", seq, total);
+                            tokio::time::sleep(timeout_duration).await;
 
-                                        health.record_error().await;
-                                        container.tunnel_metrics.record_heartbeat_timeout();
+                            if !heartbeat_state.pong_received.load(Ordering::SeqCst) {
+                                let total = heartbeat_state.record_ping_timeout().await;
+                                tracing::warn!(
+                                    "Session {}: heartbeat timeout (seq={}), consecutive misses: {}",
+                                    session_id, seq, total
+                                );
 
-                                        if total >= max_missed {
-                                            tracing::error!("Heartbeat failed: {} consecutive timeouts", total);
-                                            health.set_status(HealthStatus::Unhealthy).await;
-                                            if reconnection_enabled {
-                                                container.reconnection_needed.store(true, Ordering::SeqCst);
-                                            }
-                                        } else if total >= max_missed / 2 {
-                                            health.set_status(HealthStatus::Degraded).await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to send heartbeat: {}", e);
-                                    health.record_error().await;
+                                health_monitor.record_error().await;
+                                tunnel_metrics.record_heartbeat_timeout();
+
+                                if total >= max_missed {
+                                    tracing::error!(
+                                        "Session {}: heartbeat dead, {} consecutive timeouts",
+                                        session_id, total
+                                    );
+                                    health_monitor.set_status(HealthStatus::Unhealthy).await;
+                                    let _ = recovery_tx.send(TunnelRecoverySignal::HeartbeatDead { session_id });
+                                    break;
+                                } else if total >= max_missed / 2 {
+                                    health_monitor.set_status(HealthStatus::Degraded).await;
                                 }
                             }
                         }
                     }
-                    _ = shutdown.changed() => {
-                        tracing::info!("Heartbeat task shutting down");
+                    _ = session_shutdown_rx.changed() => {
+                        tracing::info!("Session {}: heartbeat shutting down", session_id);
                         break;
                     }
                 }
             }
         });
+    }
 
-        Ok(())
+    async fn teardown_session(&self, session: &Arc<TunnelSession>) {
+        tracing::info!("Tearing down session {}", session.session_id);
+        let _ = session.session_shutdown.send(true);
+        session.connection_registry.write().await.clear();
+    }
+
+    async fn reconnect_tunnel(&self) -> Result<(), SourceError> {
+        if !self.circuit_breaker.should_allow_restart().await {
+            return Err(SourceError::ConfigError(
+                "Circuit breaker open -- too many recent restarts".to_string(),
+            ));
+        }
+
+        self.tunnel_metrics.record_reconnection_attempt();
+
+        let reconnection_manager =
+            ReconnectionManager::new(self.config.clone(), self.health_monitor.clone());
+
+        reconnection_manager
+            .reconnect(|| async {
+                let session = self.establish_session().await?;
+                let mut active = self.active_session.write().await;
+                *active = Some(session);
+                Ok(())
+            })
+            .await
+    }
+
+    async fn create_new_session(&self) -> Result<Arc<TunnelSession>, SourceError> {
+        self.establish_session().await
+    }
+
+    async fn retire_session(&self, session: Arc<TunnelSession>) {
+        let drain_timeout = Duration::from_secs(self.config.connection_drain_timeout_secs);
+        let retiring = self.retiring_sessions.clone();
+
+        {
+            let mut sessions = retiring.lock().await;
+            sessions.push(session.clone());
+        }
+
+        let session_id = session.session_id;
+        tokio::spawn(async move {
+            let deadline = Instant::now() + drain_timeout;
+
+            loop {
+                let count = session.connection_registry.read().await.len();
+                if count == 0 {
+                    tracing::info!("Session {} drained cleanly", session_id);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(
+                        "Session {} drain timeout, {} connections remaining",
+                        session_id,
+                        count
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            let _ = session.session_shutdown.send(true);
+            session.connection_registry.write().await.clear();
+
+            let mut sessions = retiring.lock().await;
+            sessions.retain(|s| s.session_id != session_id);
+
+            tracing::info!("Session {} fully retired", session_id);
+        });
     }
 
     pub async fn handle_client(
@@ -1069,6 +1123,11 @@ impl SourceContainer {
         target_port: u16,
         protocol: Protocol,
     ) -> Result<(), SourceError> {
+        let session = {
+            let guard = self.active_session.read().await;
+            guard.clone().ok_or(SourceError::NotConnected)?
+        };
+
         let (conn, tx_from_tunnel, _rx_to_tunnel) = self
             .connection_manager
             .create_connection(addr, protocol, target_port)
@@ -1076,10 +1135,11 @@ impl SourceContainer {
 
         let conn_id = conn.id();
 
-        // Register connection for demux routing
-        self.register_connection(conn_id, tx_from_tunnel).await;
+        {
+            let mut registry = session.connection_registry.write().await;
+            registry.insert(conn_id, tx_from_tunnel);
+        }
 
-        // Extract rx_from_tunnel to receive frames routed by demux
         let mut rx_from_tunnel = {
             let mut rx_guard = conn.rx_from_tunnel.write().await;
             rx_guard.take().ok_or(SourceError::ConfigError(
@@ -1087,11 +1147,12 @@ impl SourceContainer {
             ))?
         };
 
-        // Send CONNECT frame with actual target port
         let connect_frame = Frame::new_connect(conn_id, target_port, protocol);
-        self.send_frame(connect_frame).await?;
+        session
+            .write_queue_tx
+            .send(connect_frame)
+            .map_err(|_| SourceError::NotConnected)?;
 
-        // Wait for CONNECT_ACK with timeout (handles early client disconnect)
         let ack_frame =
             match tokio::time::timeout(Duration::from_secs(5), rx_from_tunnel.recv()).await {
                 Ok(Some(frame)) => frame,
@@ -1100,63 +1161,59 @@ impl SourceContainer {
                         "Connection {} channel closed while waiting for CONNECT_ACK",
                         conn_id
                     );
-                    self.unregister_connection(conn_id).await;
+                    session.connection_registry.write().await.remove(&conn_id);
                     self.connection_manager.remove_connection(conn_id).await;
                     return Err(SourceError::ConfigError(
                         "Channel closed while waiting for CONNECT_ACK".to_string(),
                     ));
                 }
                 Err(_) => {
-                    // Timeout - likely client disconnected or destination issue
                     tracing::debug!("Connection {} timeout waiting for CONNECT_ACK", conn_id);
                     let mut fin_frame = Frame::new_data(conn_id, 0, &[]).unwrap();
                     fin_frame.set_fin();
-                    let _ = self.send_frame(fin_frame).await;
-                    self.unregister_connection(conn_id).await;
+                    let _ = session.write_queue_tx.send(fin_frame);
+                    session.connection_registry.write().await.remove(&conn_id);
                     self.connection_manager.remove_connection(conn_id).await;
-                    return Ok(()); // Clean exit
+                    return Ok(());
                 }
             };
 
         if ack_frame.frame_type() != FrameType::ConnectAck {
-            self.unregister_connection(conn_id).await;
+            session.connection_registry.write().await.remove(&conn_id);
             self.connection_manager.remove_connection(conn_id).await;
             return Err(SourceError::ConfigError("Expected CONNECT_ACK".to_string()));
         }
 
         if ack_frame.payload().is_empty() || ack_frame.payload()[0] == 0 {
-            self.unregister_connection(conn_id).await;
+            session.connection_registry.write().await.remove(&conn_id);
             self.connection_manager.remove_connection(conn_id).await;
             return Err(SourceError::ConfigError("Connection rejected".to_string()));
         }
 
         conn.set_state(super::ConnectionState::Established).await;
 
-        // Bidirectional forwarding
         let conn_clone = conn.clone();
-        let self_clone = Arc::new(self.clone());
+        let session_for_task = session.clone();
+        let conn_manager = self.connection_manager.clone();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
             loop {
                 tokio::select! {
-                    // Read from client, send to tunnel
                     result = stream.read(&mut buf) => {
                         match result {
                             Ok(0) => {
-                                // Client closed connection
                                 let mut close_frame = Frame::new_data(conn_clone.id(), 0, &[]).unwrap();
                                 close_frame.set_fin();
-                                let _ = self_clone.send_frame(close_frame).await;
+                                let _ = session_for_task.write_queue_tx.send(close_frame);
                                 break;
                             }
                             Ok(n) => {
-                                // Record activity to prevent unnecessary pings
-                                self_clone.heartbeat_state.record_activity().await;
+                                session_for_task.heartbeat_state.record_activity().await;
 
                                 let frame = Frame::new_data(conn_clone.id(), 0, &buf[..n]).unwrap();
-                                if let Err(e) = self_clone.send_frame(frame).await {
-                                    tracing::error!("Failed to send frame: {}", e);
+                                if session_for_task.write_queue_tx.send(frame).is_err() {
+                                    tracing::error!("Session write queue closed, ending client handler");
                                     break;
                                 }
                                 conn_clone.record_send(n);
@@ -1168,12 +1225,10 @@ impl SourceContainer {
                         }
                     }
 
-                    // Receive from tunnel, write to client
                     frame = rx_from_tunnel.recv() => {
                         match frame {
                             Some(f) => {
-                                // Record activity
-                                self_clone.heartbeat_state.record_activity().await;
+                                session_for_task.heartbeat_state.record_activity().await;
 
                                 if let Err(e) = stream.write_all(f.payload()).await {
                                     tracing::error!("Failed to write to client: {}", e);
@@ -1191,86 +1246,48 @@ impl SourceContainer {
                 }
             }
 
-            // Cleanup connection from registry and manager
-            self_clone.unregister_connection(conn_clone.id()).await;
+            {
+                let mut registry = session_for_task.connection_registry.write().await;
+                registry.remove(&conn_clone.id());
+            }
             conn_clone.set_state(super::ConnectionState::Closed).await;
-            self_clone
-                .connection_manager
-                .remove_connection(conn_clone.id())
-                .await;
+            conn_manager.remove_connection(conn_clone.id()).await;
         });
 
         Ok(())
     }
 
-    /// Number of connections tracked by the ConnectionManager
     pub async fn connection_count(&self) -> usize {
         self.connection_manager.connection_count().await
     }
 
-    /// Number of entries in the demux connection registry
     pub async fn registry_count(&self) -> usize {
-        self.connection_registry.read().await.len()
+        let guard = self.active_session.read().await;
+        match guard.as_ref() {
+            Some(session) => session.connection_registry.read().await.len(),
+            None => 0,
+        }
     }
 
     pub async fn send_frame(&self, frame: Frame) -> Result<(), SourceError> {
-        // Use write queue for lock-free sending
-        let tx_guard = self.write_queue_tx.read().await;
-        if let Some(ref tx) = *tx_guard {
-            tx.send(frame).map_err(|_| SourceError::NotConnected)?;
+        let guard = self.active_session.read().await;
+        if let Some(ref session) = *guard {
+            session
+                .write_queue_tx
+                .send(frame)
+                .map_err(|_| SourceError::NotConnected)?;
             Ok(())
         } else {
             Err(SourceError::NotConnected)
         }
     }
 
-    #[allow(dead_code)] // Public API method (deprecated in favor of demux)
+    #[allow(dead_code)]
     pub async fn receive_frame(&self) -> Result<Frame, SourceError> {
-        let mut tunnel_stream = self.tunnel_stream.write().await;
-        let stream = tunnel_stream.as_mut().ok_or(SourceError::NotConnected)?;
-
-        // Read frame length with timeout
-        let len = match timeout(FRAME_READ_TIMEOUT, stream.read_u32()).await {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => return Err(SourceError::IoError(e)),
-            Err(_) => return Err(SourceError::Timeout),
-        };
-
-        // Validate frame size before allocation
-        if len > MAX_FRAME_SIZE {
-            return Err(SourceError::FrameTooLarge {
-                size: len,
-                max: MAX_FRAME_SIZE,
-            });
-        }
-
-        let mut buf = vec![0u8; len as usize];
-        match timeout(FRAME_READ_TIMEOUT, stream.read_exact(&mut buf)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(SourceError::IoError(e)),
-            Err(_) => return Err(SourceError::Timeout),
-        }
-
-        let codec = self.frame_codec.read().await;
-        let codec = codec.as_ref().ok_or(SourceError::NotConnected)?;
-
-        let wire_frame = super::WireFrame::new(buf);
-        let frame = codec.decode(&wire_frame)?;
-
-        // Handle Pong frames for heartbeat
-        if frame.frame_type() == FrameType::Pong {
-            let seq = frame.sequence();
-            if let Some(rtt) = self.heartbeat_state.record_pong_received(seq).await {
-                tracing::debug!("Received pong (seq={}) RTT: {:?}", seq, rtt);
-                self.health_monitor.record_success().await;
-            }
-        }
-
-        Ok(frame)
+        Err(SourceError::NotConnected)
     }
 
     pub async fn run(&self) -> Result<(), SourceError> {
-        // Setup all listeners
         let listeners = self.setup_listeners().await?;
 
         if listeners.is_empty() {
@@ -1281,11 +1298,25 @@ impl SourceContainer {
 
         tracing::info!("Running with {} listener(s)", listeners.len());
 
-        // Create a channel for accepted connections
+        let mut recovery_rx = {
+            let mut rx_guard = self.recovery_rx.lock().await;
+            rx_guard.take().ok_or(SourceError::ConfigError(
+                "recovery_rx already taken -- run() called twice?".to_string(),
+            ))?
+        };
+
+        let refresh_secs = self.config.connection_refresh_interval_secs;
+        let refresh_interval = if refresh_secs > 0 {
+            Duration::from_secs(refresh_secs)
+        } else {
+            Duration::from_secs(365 * 24 * 3600)
+        };
+        let mut refresh_timer = tokio::time::interval(refresh_interval);
+        refresh_timer.tick().await;
+
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<(TcpStream, SocketAddr, u16, Protocol)>();
 
-        // Spawn a task for each listener
         let mut listener_handles = Vec::new();
 
         for port_listener in listeners {
@@ -1322,10 +1353,8 @@ impl SourceContainer {
             listener_handles.push(handle);
         }
 
-        // Drop the original sender so the channel closes when all listener tasks finish
         drop(tx);
 
-        // Main loop: process accepted connections
         let mut shutdown_rx = self.shutdown.subscribe();
 
         loop {
@@ -1340,14 +1369,84 @@ impl SourceContainer {
                         }
                     });
                 }
+
                 _ = shutdown_rx.changed() => {
                     tracing::info!("Shutdown signal received");
                     break;
                 }
+
+                Some(signal) = recovery_rx.recv() => {
+                    let signal_session_id = signal.session_id();
+                    tracing::warn!("Recovery signal received: {:?}", signal);
+
+                    while recovery_rx.try_recv().is_ok() {}
+
+                    let active_session_id = {
+                        let guard = self.active_session.read().await;
+                        guard.as_ref().map(|s| s.session_id)
+                    };
+
+                    if active_session_id != Some(signal_session_id) {
+                        tracing::info!(
+                            "Ignoring recovery signal for old session {} (active: {:?})",
+                            signal_session_id, active_session_id
+                        );
+                        continue;
+                    }
+
+                    if !self.config.reconnection_enabled {
+                        tracing::error!("Tunnel dead but reconnection disabled -- shutting down");
+                        break;
+                    }
+
+                    if let Some(session) = self.active_session.write().await.take() {
+                        self.teardown_session(&session).await;
+                    }
+
+                    match self.reconnect_tunnel().await {
+                        Ok(()) => {
+                            tracing::info!("Tunnel recovery successful, resuming operations");
+                        }
+                        Err(e) => {
+                            tracing::error!("Tunnel recovery failed permanently: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                _ = refresh_timer.tick() => {
+                    if self.config.connection_refresh_interval_secs == 0 {
+                        continue;
+                    }
+
+                    tracing::info!("Proactive blue-green connection refresh triggered");
+
+                    match self.create_new_session().await {
+                        Ok(new_session) => {
+                            let old_session = {
+                                let mut active = self.active_session.write().await;
+                                let old = active.take();
+                                *active = Some(new_session);
+                                old
+                            };
+
+                            if let Some(old) = old_session {
+                                self.retire_session(old).await;
+                            }
+
+                            tracing::info!("Blue-green refresh complete");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Blue-green refresh failed, keeping current connection: {}",
+                                e
+                            );
+                        }
+                    }
+                }
             }
         }
 
-        // Wait for all listener tasks to finish
         for handle in listener_handles {
             let _ = handle.await;
         }
@@ -1362,23 +1461,18 @@ impl Clone for SourceContainer {
             config: self.config.clone(),
             key_manager: self.key_manager.clone(),
             connection_manager: self.connection_manager.clone(),
-            frame_codec: self.frame_codec.clone(),
-            tunnel_stream: self.tunnel_stream.clone(),
-            tunnel_read: self.tunnel_read.clone(),
-            tunnel_write: self.tunnel_write.clone(),
             shutdown: self.shutdown.clone(),
             metrics: self.metrics.clone(),
             health_monitor: self.health_monitor.clone(),
             max_handshake_size: self.max_handshake_size,
-            heartbeat_state: self.heartbeat_state.clone(),
             ping_sequence: self.ping_sequence.clone(),
-            connection_registry: self.connection_registry.clone(),
-            write_queue_tx: self.write_queue_tx.clone(),
-            demux_handle: self.demux_handle.clone(),
             tunnel_metrics: self.tunnel_metrics.clone(),
             circuit_breaker: self.circuit_breaker.clone(),
-            demux_watchdog: self.demux_watchdog.clone(),
-            reconnection_needed: self.reconnection_needed.clone(),
+            active_session: self.active_session.clone(),
+            retiring_sessions: self.retiring_sessions.clone(),
+            recovery_tx: self.recovery_tx.clone(),
+            recovery_rx: self.recovery_rx.clone(),
+            session_counter: self.session_counter.clone(),
         }
     }
 }

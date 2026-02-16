@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `TunnelSession` abstraction encapsulating a complete tunnel connection (codec, writer, demux, heartbeat) with per-session shutdown, enabling concurrent sessions for blue-green refresh.
+- `TunnelRecoverySignal` channel replacing the dead `reconnection_needed` AtomicBool -- heartbeat, demux, and writer tasks now signal failures via typed messages (`HeartbeatDead`, `DemuxExited`, `WriterExited`).
+- Runtime tunnel recovery in `run()` -- recovery signals are received and processed in the main select loop, triggering teardown of the failed session and reconnection with exponential backoff.
+- Blue-green proactive connection refresh -- a configurable timer (`connection_refresh_interval_secs`, default 1 hour) establishes a new tunnel session, atomically swaps it as active, and gracefully drains the old session.
+- `retire_session()` method for graceful session draining with configurable timeout (`connection_drain_timeout_secs`, default 60s) before force-closing old sessions.
+- `HeartbeatState::reset()` method for clearing all tracking fields.
+- `connection_refresh_interval_secs` and `connection_drain_timeout_secs` configuration fields on `SourceConfig`.
+- Comprehensive reconnection test suite (`tests/reconnection_tests.rs`) covering heartbeat recovery, demux/writer failure detection, full recovery cycles, blue-green zero-downtime refresh, drain timeout, circuit breaker integration, and backoff timing.
+
+### Fixed
+- Heartbeat now **breaks** and signals recovery after `max_missed_pongs` consecutive timeouts instead of logging forever and setting a flag nobody reads.
+- Demux task now sends `DemuxExited` recovery signal on read errors instead of silently exiting.
+- Writer task now sends `WriterExited` recovery signal on write errors instead of silently exiting.
+- DemuxWatchdog was created but never started (`spawn_watchdog()` was never called) -- replaced with the recovery signal channel which is always active.
+- Runtime reconnection now works: previously `ReconnectionManager` only ran during `start()`, so dead tunnels after `run()` began stayed dead permanently.
+
+### Changed
+- Extracted tunnel connection state from flat `SourceContainer` fields into `TunnelSession` struct, enabling multiple concurrent sessions.
+- `handle_client()` now captures `Arc<TunnelSession>` at connection time, binding the client to its session for the connection lifetime (supports blue-green: old clients drain on old session, new clients use new session).
+- Heartbeat, demux, and writer tasks no longer clone `SourceContainer` -- they receive individual fields and a per-session shutdown channel.
+- Writer task now owns `OwnedWriteHalf` directly instead of going through `Arc<Mutex<Option<OwnedWriteHalf>>>`, eliminating lock contention entirely.
+- `send_frame()` and `registry_count()` now route through the active session.
+- Removed `frame_codec`, `tunnel_stream`, `tunnel_read`, `tunnel_write`, `write_queue_tx`, `connection_registry`, `heartbeat_state`, `demux_handle`, `demux_watchdog`, and `reconnection_needed` fields from `SourceContainer`.
+
 ## [0.1.7] - 2026-02-15
 
 ### Fixed

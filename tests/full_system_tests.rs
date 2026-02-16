@@ -182,6 +182,8 @@ async fn test_single_port_end_to_end() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     // Start source
@@ -361,6 +363,8 @@ async fn test_multiple_ports_concurrent() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -491,6 +495,8 @@ async fn test_chaos_massive_concurrent_connections() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -621,6 +627,8 @@ async fn test_large_payload_transfer() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -752,6 +760,8 @@ async fn test_rapid_connection_churn() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -876,6 +886,8 @@ async fn test_race_condition_simultaneous_operations() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -1001,6 +1013,8 @@ async fn test_heavy_load_1000_connections() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -1130,6 +1144,8 @@ async fn test_memory_stress_sequential_connections() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -1239,6 +1255,8 @@ async fn test_interleaved_data_integrity() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();
@@ -1370,6 +1388,8 @@ async fn test_connection_drop_resilience() {
         client_cert_path: cert_dir.path().join("client.crt"),
         client_key_path: cert_dir.path().join("client.key"),
         ca_cert_path: cert_dir.path().join("ca.crt"),
+        connection_refresh_interval_secs: 0,
+        connection_drain_timeout_secs: 60,
     };
 
     let crypto_config = default_crypto_config();

@@ -631,9 +631,9 @@ async fn test_recovery_during_active_traffic() {
 
     // Kill dest while connections are active
     dest.stop().await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // heartbeat_interval=2s, timeout=1s, max_missed=3 -> ~9s to detect
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
-    // Source should have detected the failure
     let health = source.health_monitor();
     let status = health.check_health().await;
     assert!(
@@ -774,14 +774,15 @@ async fn test_blue_green_refresh_zero_downtime() {
 
     let (_echo_handle, _echo_running) = start_echo_server(echo_port).await.unwrap();
 
-    // Start with a very short refresh interval (3 seconds) for testing
+    // Refresh interval must exceed handshake time and be large enough
+    // that only one refresh fires during the test window
     let (source, _dest) = start_stack(
         cert_dir.path(),
         echo_port,
         tunnel_port,
         listen_port,
         true,
-        3, // 3 second refresh interval
+        30,
     )
     .await;
 
@@ -803,8 +804,8 @@ async fn test_blue_green_refresh_zero_downtime() {
     pre_refresh_client.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"BEFORE_REFRESH");
 
-    // Wait for refresh to happen (3 second interval + some margin)
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for refresh (30s) + handshake (~10s) + margin
+    tokio::time::sleep(Duration::from_secs(45)).await;
 
     // The pre-refresh connection should still work (bound to old session, draining)
     let still_works = timeout(Duration::from_secs(3), async {
@@ -856,8 +857,8 @@ async fn test_blue_green_drain_timeout() {
 
     let (_echo_handle, _echo_running) = start_echo_server(echo_port).await.unwrap();
 
-    // Short drain timeout (2s) and short refresh interval (3s)
-    let source_config = make_source_config(cert_dir.path(), listen_port, tunnel_port, true, 3, 2);
+    // Short drain timeout (2s), refresh interval large enough for single refresh
+    let source_config = make_source_config(cert_dir.path(), listen_port, tunnel_port, true, 30, 2);
 
     let dest_config = make_dest_config(cert_dir.path(), tunnel_port, echo_port, listen_port);
     let dest = Arc::new(
@@ -898,8 +899,8 @@ async fn test_blue_green_drain_timeout() {
     client.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"DRAIN_TEST");
 
-    // Wait for refresh (3s) + drain timeout (2s) + margin
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Wait for refresh (30s) + handshake (~10s) + drain timeout (2s) + margin
+    tokio::time::sleep(Duration::from_secs(47)).await;
 
     // After drain timeout, old session should be forcibly closed
     // New connections should still work on the new session

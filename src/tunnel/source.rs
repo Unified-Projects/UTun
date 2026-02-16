@@ -1372,6 +1372,7 @@ impl SourceContainer {
             Duration::from_secs(365 * 24 * 3600)
         };
         let mut refresh_timer = tokio::time::interval(refresh_interval);
+        refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         refresh_timer.tick().await;
 
         let (tx, mut rx) =
@@ -1506,6 +1507,8 @@ impl SourceContainer {
                 }
             }
         }
+
+        let _ = self.shutdown.send(true);
 
         for handle in listener_handles {
             let _ = handle.await;

@@ -317,19 +317,28 @@ impl DestContainer {
             }
         });
 
+        let mut tunnel_shutdown_rx = self.shutdown.subscribe();
         let mut read_buf = Vec::with_capacity(8192);
         loop {
-            let len = match timeout(FRAME_READ_TIMEOUT, read_half.read_u32()).await {
-                Ok(Ok(l)) => l,
-                Ok(Err(e)) => {
-                    tracing::debug!("Stream closed: {}", e);
-                    break;
+            let len = tokio::select! {
+                result = timeout(FRAME_READ_TIMEOUT, read_half.read_u32()) => {
+                    match result {
+                        Ok(Ok(l)) => l,
+                        Ok(Err(e)) => {
+                            tracing::debug!("Stream closed: {}", e);
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("Frame length read timeout - closing connection");
+                            drop(response_tx);
+                            let _ = writer_handle.await;
+                            return Err(DestError::Timeout);
+                        }
+                    }
                 }
-                Err(_) => {
-                    tracing::warn!("Frame length read timeout - closing connection");
-                    drop(response_tx);
-                    let _ = writer_handle.await;
-                    return Err(DestError::Timeout);
+                _ = tunnel_shutdown_rx.changed() => {
+                    tracing::info!("Tunnel handler received shutdown signal");
+                    break;
                 }
             };
 

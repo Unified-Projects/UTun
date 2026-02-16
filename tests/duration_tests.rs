@@ -174,6 +174,7 @@ async fn setup_full_stack(
         ca_cert_path: cert_dir.join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();

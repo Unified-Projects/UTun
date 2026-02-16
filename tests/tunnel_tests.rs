@@ -123,7 +123,7 @@ mod connection_tests {
 
         assert_eq!(conn.id(), 1);
         assert_eq!(conn.remote_addr(), addr);
-        assert_eq!(conn.state().await, ConnectionState::Connecting);
+        assert_eq!(conn.state(), ConnectionState::Connecting);
     }
 
     #[tokio::test]
@@ -131,14 +131,14 @@ mod connection_tests {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let (conn, _tx, _rx) = Connection::new(1, addr, Protocol::Tcp, 8080);
 
-        conn.set_state(ConnectionState::Handshaking).await;
-        assert_eq!(conn.state().await, ConnectionState::Handshaking);
+        conn.set_state(ConnectionState::Handshaking);
+        assert_eq!(conn.state(), ConnectionState::Handshaking);
 
-        conn.set_state(ConnectionState::Established).await;
-        assert_eq!(conn.state().await, ConnectionState::Established);
+        conn.set_state(ConnectionState::Established);
+        assert_eq!(conn.state(), ConnectionState::Established);
 
-        conn.set_state(ConnectionState::Closed).await;
-        assert_eq!(conn.state().await, ConnectionState::Closed);
+        conn.set_state(ConnectionState::Closed);
+        assert_eq!(conn.state(), ConnectionState::Closed);
     }
 
     #[tokio::test]

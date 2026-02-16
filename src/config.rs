@@ -95,6 +95,9 @@ pub struct SourceConfig {
     #[serde(default)]
     pub exposed_ports: Vec<ExposedPortConfig>,
 
+    #[serde(default = "default_write_queue_size")]
+    pub write_queue_size: usize,
+
     // Blue-green connection refresh
     #[serde(default = "default_connection_refresh_interval")]
     pub connection_refresh_interval_secs: u64, // 0 = disabled
@@ -406,6 +409,9 @@ fn default_circuit_breaker_max_restarts() -> usize {
 }
 fn default_stale_cleanup_interval() -> u64 {
     15
+}
+fn default_write_queue_size() -> usize {
+    8192
 }
 fn default_connection_refresh_interval() -> u64 {
     3600

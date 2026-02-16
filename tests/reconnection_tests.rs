@@ -170,6 +170,7 @@ fn make_source_config(
         ca_cert_path: cert_dir.join("ca.crt"),
         connection_refresh_interval_secs: refresh_interval_secs,
         connection_drain_timeout_secs: drain_timeout_secs,
+        write_queue_size: 8192,
     }
 }
 

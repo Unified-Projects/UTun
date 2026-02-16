@@ -1,7 +1,7 @@
 use super::{Frame, Protocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -9,19 +9,32 @@ use tokio::sync::{mpsc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
-    Connecting,
-    Handshaking,
-    Established,
-    Closing,
-    Closed,
+    Connecting = 0,
+    Handshaking = 1,
+    Established = 2,
+    Closing = 3,
+    Closed = 4,
+}
+
+impl ConnectionState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Connecting,
+            1 => Self::Handshaking,
+            2 => Self::Established,
+            3 => Self::Closing,
+            _ => Self::Closed,
+        }
+    }
 }
 
 #[allow(dead_code)] // Fields used by public API methods
 pub struct Connection {
     id: u32,
     remote_addr: SocketAddr,
-    state: RwLock<ConnectionState>,
-    last_activity: RwLock<Instant>,
+    state: AtomicU8,
+    epoch: Instant,
+    last_activity_us: AtomicU64,
     bytes_received: AtomicU64,
     bytes_sent: AtomicU64,
     service_name: RwLock<Option<String>>,
@@ -53,8 +66,9 @@ impl Connection {
         let conn = Self {
             id,
             remote_addr,
-            state: RwLock::new(ConnectionState::Connecting),
-            last_activity: RwLock::new(Instant::now()),
+            state: AtomicU8::new(ConnectionState::Connecting as u8),
+            epoch: Instant::now(),
+            last_activity_us: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             service_name: RwLock::new(None),
@@ -66,13 +80,12 @@ impl Connection {
         (conn, tx_from_tunnel, rx_to_tunnel)
     }
 
-    pub async fn set_state(&self, state: ConnectionState) {
-        let mut s = self.state.write().await;
-        *s = state;
+    pub fn set_state(&self, state: ConnectionState) {
+        self.state.store(state as u8, Ordering::Relaxed);
     }
 
-    pub async fn state(&self) -> ConnectionState {
-        *self.state.read().await
+    pub fn state(&self) -> ConnectionState {
+        ConnectionState::from_u8(self.state.load(Ordering::Relaxed))
     }
 
     pub fn record_send(&self, bytes: usize) {
@@ -137,14 +150,15 @@ impl Connection {
         }
     }
 
-    pub async fn touch(&self) {
-        let mut last = self.last_activity.write().await;
-        *last = Instant::now();
+    pub fn touch(&self) {
+        let us = self.epoch.elapsed().as_micros() as u64;
+        self.last_activity_us.store(us, Ordering::Relaxed);
     }
 
-    pub async fn is_idle(&self, timeout: Duration) -> bool {
-        let last = self.last_activity.read().await;
-        last.elapsed() > timeout
+    pub fn is_idle(&self, timeout: Duration) -> bool {
+        let last_us = self.last_activity_us.load(Ordering::Relaxed);
+        let now_us = self.epoch.elapsed().as_micros() as u64;
+        now_us.saturating_sub(last_us) > timeout.as_micros() as u64
     }
 }
 
@@ -287,20 +301,22 @@ impl ConnectionManager {
     /// Remove stale connections (closed or idle past timeout).
     /// Returns the IDs of removed connections so callers can sync other data structures.
     pub async fn cleanup_stale(&self) -> Vec<u32> {
-        let mut connections = self.connections.write().await;
-        let mut to_remove = Vec::new();
+        let to_remove: Vec<u32> = {
+            let connections = self.connections.read().await;
+            connections
+                .iter()
+                .filter(|(_, conn)| {
+                    conn.state() == ConnectionState::Closed || conn.is_idle(self.connection_timeout)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
 
-        for (id, conn) in connections.iter() {
-            let state = conn.state().await;
-            let is_idle = conn.is_idle(self.connection_timeout).await;
-
-            if state == ConnectionState::Closed || is_idle {
-                to_remove.push(*id);
+        if !to_remove.is_empty() {
+            let mut connections = self.connections.write().await;
+            for id in &to_remove {
+                connections.remove(id);
             }
-        }
-
-        for id in &to_remove {
-            connections.remove(id);
         }
 
         to_remove
@@ -314,7 +330,7 @@ impl ConnectionManager {
     pub async fn close_all(&self) {
         let mut connections = self.connections.write().await;
         for (_, conn) in connections.iter() {
-            conn.set_state(ConnectionState::Closed).await;
+            conn.set_state(ConnectionState::Closed);
         }
         connections.clear();
     }
@@ -332,7 +348,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(conn.state().await, ConnectionState::Connecting);
+        assert_eq!(conn.state(), ConnectionState::Connecting);
         assert_eq!(conn.bytes_sent(), 0);
         assert_eq!(conn.bytes_received(), 0);
 
@@ -368,7 +384,7 @@ mod tests {
 
         assert_eq!(cm.connection_count().await, 1);
 
-        conn.set_state(ConnectionState::Closed).await;
+        conn.set_state(ConnectionState::Closed);
 
         let removed = cm.cleanup_stale().await;
         assert_eq!(removed.len(), 1);
@@ -380,13 +396,13 @@ mod tests {
         let (conn, _, _) =
             Connection::new(1, "127.0.0.1:8080".parse().unwrap(), Protocol::Tcp, 8080);
 
-        assert!(!conn.is_idle(Duration::from_secs(1)).await);
+        assert!(!conn.is_idle(Duration::from_secs(1)));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(conn.is_idle(Duration::from_millis(50)).await);
+        assert!(conn.is_idle(Duration::from_millis(50)));
 
-        conn.touch().await;
-        assert!(!conn.is_idle(Duration::from_secs(1)).await);
+        conn.touch();
+        assert!(!conn.is_idle(Duration::from_secs(1)));
     }
 
     #[tokio::test]
@@ -441,8 +457,8 @@ mod tests {
         assert_eq!(cm.connection_count().await, 3);
 
         // Mark two as closed
-        conn1.set_state(ConnectionState::Closed).await;
-        conn2.set_state(ConnectionState::Closed).await;
+        conn1.set_state(ConnectionState::Closed);
+        conn2.set_state(ConnectionState::Closed);
 
         let mut removed = cm.cleanup_stale().await;
         removed.sort();

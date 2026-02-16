@@ -127,80 +127,100 @@ impl ListenerManager {
 }
 
 struct HeartbeatState {
-    last_activity: Arc<RwLock<Instant>>,
-    last_ping_seq: Arc<RwLock<Option<u32>>>,
-    last_ping_time: Arc<RwLock<Option<Instant>>>,
-    consecutive_misses: Arc<RwLock<u8>>,
-    rtt_avg_us: Arc<RwLock<Option<u64>>>,
-    pong_received: Arc<AtomicBool>,
+    epoch: Instant,
+    last_activity_us: AtomicU64,
+    last_ping_seq: AtomicU32,
+    last_ping_time_us: AtomicU64,
+    consecutive_misses: std::sync::atomic::AtomicU8,
+    rtt_avg_us: AtomicU64,
+    pong_received: AtomicBool,
 }
 
 impl HeartbeatState {
     fn new() -> Self {
+        let epoch = Instant::now();
         Self {
-            last_activity: Arc::new(RwLock::new(Instant::now())),
-            last_ping_seq: Arc::new(RwLock::new(None)),
-            last_ping_time: Arc::new(RwLock::new(None)),
-            consecutive_misses: Arc::new(RwLock::new(0)),
-            rtt_avg_us: Arc::new(RwLock::new(None)),
-            pong_received: Arc::new(AtomicBool::new(false)),
+            epoch,
+            last_activity_us: AtomicU64::new(0),
+            last_ping_seq: AtomicU32::new(u32::MAX),
+            last_ping_time_us: AtomicU64::new(0),
+            consecutive_misses: std::sync::atomic::AtomicU8::new(0),
+            rtt_avg_us: AtomicU64::new(0),
+            pong_received: AtomicBool::new(false),
         }
     }
 
-    async fn reset(&self) {
-        *self.last_activity.write().await = Instant::now();
-        *self.last_ping_seq.write().await = None;
-        *self.last_ping_time.write().await = None;
-        *self.consecutive_misses.write().await = 0;
-        *self.rtt_avg_us.write().await = None;
-        self.pong_received.store(false, Ordering::SeqCst);
+    fn micros_since_epoch(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
     }
 
-    async fn record_activity(&self) {
-        *self.last_activity.write().await = Instant::now();
+    fn reset(&self) {
+        self.last_activity_us
+            .store(self.micros_since_epoch(), Ordering::Relaxed);
+        self.last_ping_seq.store(u32::MAX, Ordering::Relaxed);
+        self.last_ping_time_us.store(0, Ordering::Relaxed);
+        self.consecutive_misses.store(0, Ordering::Relaxed);
+        self.rtt_avg_us.store(0, Ordering::Relaxed);
+        self.pong_received.store(false, Ordering::Relaxed);
     }
 
-    async fn should_send_ping(&self, interval_ms: u64) -> bool {
-        self.last_activity.read().await.elapsed() >= Duration::from_millis(interval_ms)
+    fn record_activity(&self) {
+        self.last_activity_us
+            .store(self.micros_since_epoch(), Ordering::Relaxed);
     }
 
-    async fn record_ping_sent(&self, seq: u32) {
-        *self.last_ping_seq.write().await = Some(seq);
-        *self.last_ping_time.write().await = Some(Instant::now());
-        self.record_activity().await;
+    fn should_send_ping(&self, interval_ms: u64) -> bool {
+        let last = self.last_activity_us.load(Ordering::Relaxed);
+        let now = self.micros_since_epoch();
+        now.saturating_sub(last) >= interval_ms * 1000
     }
 
-    async fn record_pong_received(&self, seq: u32) -> Option<Duration> {
-        if *self.last_ping_seq.read().await == Some(seq) {
-            *self.consecutive_misses.write().await = 0;
+    fn record_ping_sent(&self, seq: u32) {
+        self.last_ping_seq.store(seq, Ordering::Relaxed);
+        self.last_ping_time_us
+            .store(self.micros_since_epoch(), Ordering::Relaxed);
+        self.record_activity();
+    }
 
-            if let Some(sent_time) = *self.last_ping_time.read().await {
-                let rtt = sent_time.elapsed();
-                let rtt_us = rtt.as_micros() as u64;
+    fn record_pong_received(&self, seq: u32) -> Option<Duration> {
+        if self.last_ping_seq.load(Ordering::Relaxed) == seq {
+            self.consecutive_misses.store(0, Ordering::Relaxed);
 
-                // EMA: 0.2 * current + 0.8 * old
-                let mut avg = self.rtt_avg_us.write().await;
-                *avg = Some(match *avg {
-                    Some(old) => (rtt_us * 2 + old * 8) / 10,
-                    None => rtt_us,
-                });
+            let sent_us = self.last_ping_time_us.load(Ordering::Relaxed);
+            if sent_us > 0 {
+                let now_us = self.micros_since_epoch();
+                let rtt_us = now_us.saturating_sub(sent_us);
 
-                self.record_activity().await;
-                return Some(rtt);
+                let old = self.rtt_avg_us.load(Ordering::Relaxed);
+                let new_avg = if old == 0 {
+                    rtt_us
+                } else {
+                    (rtt_us * 2 + old * 8) / 10
+                };
+                self.rtt_avg_us.store(new_avg, Ordering::Relaxed);
+
+                self.record_activity();
+                return Some(Duration::from_micros(rtt_us));
             }
         }
         None
     }
 
-    async fn record_ping_timeout(&self) -> u8 {
-        let mut misses = self.consecutive_misses.write().await;
-        *misses = misses.saturating_add(1);
-        *misses
+    fn record_ping_timeout(&self) -> u8 {
+        let old = self.consecutive_misses.load(Ordering::Relaxed);
+        let new = old.saturating_add(1);
+        self.consecutive_misses.store(new, Ordering::Relaxed);
+        new
     }
 
     #[allow(dead_code)]
-    async fn get_rtt_avg_us(&self) -> Option<u64> {
-        *self.rtt_avg_us.read().await
+    fn get_rtt_avg_us(&self) -> Option<u64> {
+        let v = self.rtt_avg_us.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
     }
 }
 
@@ -222,7 +242,7 @@ impl ReconnectionManager {
     }
 
     async fn calculate_backoff(&self) -> Duration {
-        let attempt = self.attempt.load(Ordering::SeqCst);
+        let attempt = self.attempt.load(Ordering::Relaxed);
 
         if attempt == 0 {
             return Duration::from_millis(0);
@@ -258,7 +278,7 @@ impl ReconnectionManager {
         let max_attempts = self.config.max_reconnect_attempts;
 
         loop {
-            let attempt = self.attempt.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.attempt.fetch_add(1, Ordering::Relaxed);
 
             if max_attempts > 0 && attempt >= max_attempts {
                 tracing::error!("Max reconnection attempts ({}) exceeded", max_attempts);
@@ -301,12 +321,12 @@ impl ReconnectionManager {
     }
 
     pub fn reset(&self) {
-        self.attempt.store(0, Ordering::SeqCst);
+        self.attempt.store(0, Ordering::Relaxed);
     }
 
     #[allow(dead_code)] // Public API method
     pub fn get_attempt_count(&self) -> u32 {
-        self.attempt.load(Ordering::SeqCst)
+        self.attempt.load(Ordering::Relaxed)
     }
 }
 
@@ -330,7 +350,7 @@ impl TunnelRecoverySignal {
 struct TunnelSession {
     session_id: u64,
     frame_codec: Arc<FrameCodec>,
-    write_queue_tx: mpsc::UnboundedSender<Frame>,
+    write_queue_tx: mpsc::Sender<Frame>,
     connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>>,
     heartbeat_state: Arc<HeartbeatState>,
     session_shutdown: watch::Sender<bool>,
@@ -611,6 +631,7 @@ impl SourceContainer {
             .set_status(HealthStatus::Connecting)
             .await;
         let stream = TcpStream::connect(&dest_addr).await?;
+        stream.set_nodelay(true).ok();
         Ok(stream)
     }
 
@@ -750,13 +771,13 @@ impl SourceContainer {
         read_half: OwnedReadHalf,
         write_half: OwnedWriteHalf,
     ) -> Arc<TunnelSession> {
-        let session_id = self.session_counter.fetch_add(1, Ordering::SeqCst);
+        let session_id = self.session_counter.fetch_add(1, Ordering::Relaxed);
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let heartbeat_state = Arc::new(HeartbeatState::new());
         let connection_registry: Arc<RwLock<HashMap<u32, mpsc::Sender<Frame>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        let (write_queue_tx, write_queue_rx) = mpsc::unbounded_channel::<Frame>();
+        let (write_queue_tx, write_queue_rx) = mpsc::channel::<Frame>(self.config.write_queue_size);
 
         Self::spawn_writer_for_session(
             session_id,
@@ -814,6 +835,7 @@ impl SourceContainer {
         stream: &mut OwnedReadHalf,
         heartbeat_state: &HeartbeatState,
         health_monitor: &HealthMonitor,
+        read_buf: &mut Vec<u8>,
     ) -> Result<Frame, SourceError> {
         let len = match timeout(FRAME_READ_TIMEOUT, stream.read_u32()).await {
             Ok(Ok(l)) => l,
@@ -828,20 +850,28 @@ impl SourceContainer {
             });
         }
 
-        let mut buf = vec![0u8; len as usize];
-        match timeout(FRAME_READ_TIMEOUT, stream.read_exact(&mut buf)).await {
+        let len_usize = len as usize;
+        if read_buf.len() < len_usize {
+            read_buf.resize(len_usize, 0);
+        }
+        match timeout(
+            FRAME_READ_TIMEOUT,
+            stream.read_exact(&mut read_buf[..len_usize]),
+        )
+        .await
+        {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(SourceError::IoError(e)),
             Err(_) => return Err(SourceError::Timeout),
         }
 
-        let wire_frame = super::WireFrame::new(buf);
+        let wire_frame = super::WireFrame::new(read_buf[..len_usize].to_vec());
         let frame = frame_codec.decode(&wire_frame)?;
 
         if frame.frame_type() == FrameType::Pong {
             let seq = frame.sequence();
-            heartbeat_state.pong_received.store(true, Ordering::SeqCst);
-            if let Some(rtt) = heartbeat_state.record_pong_received(seq).await {
+            heartbeat_state.pong_received.store(true, Ordering::Release);
+            if let Some(rtt) = heartbeat_state.record_pong_received(seq) {
                 tracing::debug!("Received pong (seq={}) RTT: {:?}", seq, rtt);
                 health_monitor.record_success().await;
             }
@@ -862,6 +892,7 @@ impl SourceContainer {
         mut read_half: OwnedReadHalf,
     ) {
         tokio::spawn(async move {
+            let mut read_buf = Vec::with_capacity(8192);
             loop {
                 tokio::select! {
                     _ = session_shutdown_rx.changed() => {
@@ -869,7 +900,7 @@ impl SourceContainer {
                         break;
                     }
                     frame_result = SourceContainer::read_frame_for_session(
-                        &frame_codec, &mut read_half, &heartbeat_state, &health_monitor
+                        &frame_codec, &mut read_half, &heartbeat_state, &health_monitor, &mut read_buf
                     ) => {
                         match frame_result {
                             Ok(frame) => {
@@ -924,7 +955,7 @@ impl SourceContainer {
         recovery_tx: mpsc::UnboundedSender<TunnelRecoverySignal>,
         mut session_shutdown_rx: watch::Receiver<bool>,
         mut write_half: OwnedWriteHalf,
-        mut write_queue_rx: mpsc::UnboundedReceiver<Frame>,
+        mut write_queue_rx: mpsc::Receiver<Frame>,
     ) {
         let _ = &tunnel_metrics;
 
@@ -936,24 +967,38 @@ impl SourceContainer {
                         break;
                     }
                     Some(frame) = write_queue_rx.recv() => {
-                        let wire_frame = match frame_codec.encode(&frame) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                tracing::error!("Session {}: encode error: {}", session_id, e);
-                                continue;
-                            }
-                        };
+                        let mut frames = vec![frame];
+                        while let Ok(extra) = write_queue_rx.try_recv() {
+                            frames.push(extra);
+                        }
 
-                        if let Err(e) = write_half.write_u32(wire_frame.len() as u32).await {
-                            tracing::error!("Session {}: write length error: {}", session_id, e);
+                        let mut write_error = false;
+                        for f in &frames {
+                            let wire_frame = match frame_codec.encode(f) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    tracing::error!("Session {}: encode error: {}", session_id, e);
+                                    continue;
+                                }
+                            };
+
+                            if let Err(e) = write_half.write_u32(wire_frame.len() as u32).await {
+                                tracing::error!("Session {}: write length error: {}", session_id, e);
+                                write_error = true;
+                                break;
+                            }
+                            if let Err(e) = write_half.write_all(wire_frame.as_bytes()).await {
+                                tracing::error!("Session {}: write data error: {}", session_id, e);
+                                write_error = true;
+                                break;
+                            }
+                        }
+
+                        if write_error {
                             let _ = recovery_tx.send(TunnelRecoverySignal::WriterExited { session_id });
                             break;
                         }
-                        if let Err(e) = write_half.write_all(wire_frame.as_bytes()).await {
-                            tracing::error!("Session {}: write data error: {}", session_id, e);
-                            let _ = recovery_tx.send(TunnelRecoverySignal::WriterExited { session_id });
-                            break;
-                        }
+
                         if let Err(e) = write_half.flush().await {
                             tracing::error!("Session {}: flush error: {}", session_id, e);
                             let _ = recovery_tx.send(TunnelRecoverySignal::WriterExited { session_id });
@@ -971,7 +1016,7 @@ impl SourceContainer {
     #[allow(clippy::too_many_arguments)]
     fn spawn_heartbeat_for_session(
         session_id: u64,
-        write_queue_tx: mpsc::UnboundedSender<Frame>,
+        write_queue_tx: mpsc::Sender<Frame>,
         heartbeat_state: Arc<HeartbeatState>,
         health_monitor: Arc<HealthMonitor>,
         ping_sequence: Arc<AtomicU32>,
@@ -989,30 +1034,41 @@ impl SourceContainer {
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
-                        if heartbeat_state.should_send_ping(interval.as_millis() as u64).await {
-                            let seq = ping_sequence.fetch_add(1, Ordering::SeqCst);
+                        if heartbeat_state.should_send_ping(interval.as_millis() as u64) {
+                            let seq = ping_sequence.fetch_add(1, Ordering::Relaxed);
                             let ping = Frame::new_ping(seq);
 
                             tracing::debug!("Session {}: sending heartbeat ping (seq={})", session_id, seq);
 
                             // Clear before send to avoid pong/timeout race
-                            heartbeat_state.pong_received.store(false, Ordering::SeqCst);
+                            heartbeat_state.pong_received.store(false, Ordering::Relaxed);
 
-                            if write_queue_tx.send(ping).is_err() {
-                                tracing::error!(
-                                    "Session {}: heartbeat send failed (queue closed)",
-                                    session_id
-                                );
-                                let _ = recovery_tx.send(TunnelRecoverySignal::HeartbeatDead { session_id });
-                                break;
+                            match write_queue_tx.try_send(ping) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        "Session {}: write queue full, skipping ping",
+                                        session_id
+                                    );
+                                    tunnel_metrics.record_channel_full();
+                                    continue;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!(
+                                        "Session {}: heartbeat send failed (queue closed)",
+                                        session_id
+                                    );
+                                    let _ = recovery_tx.send(TunnelRecoverySignal::HeartbeatDead { session_id });
+                                    break;
+                                }
                             }
 
-                            heartbeat_state.record_ping_sent(seq).await;
+                            heartbeat_state.record_ping_sent(seq);
 
                             tokio::time::sleep(timeout_duration).await;
 
-                            if !heartbeat_state.pong_received.load(Ordering::SeqCst) {
-                                let total = heartbeat_state.record_ping_timeout().await;
+                            if !heartbeat_state.pong_received.load(Ordering::Acquire) {
+                                let total = heartbeat_state.record_ping_timeout();
                                 tracing::warn!(
                                     "Session {}: heartbeat timeout (seq={}), consecutive misses: {}",
                                     session_id, seq, total
@@ -1123,6 +1179,8 @@ impl SourceContainer {
         target_port: u16,
         protocol: Protocol,
     ) -> Result<(), SourceError> {
+        stream.set_nodelay(true).ok();
+
         let session = {
             let guard = self.active_session.read().await;
             guard.clone().ok_or(SourceError::NotConnected)?
@@ -1151,6 +1209,7 @@ impl SourceContainer {
         session
             .write_queue_tx
             .send(connect_frame)
+            .await
             .map_err(|_| SourceError::NotConnected)?;
 
         let ack_frame =
@@ -1171,7 +1230,7 @@ impl SourceContainer {
                     tracing::debug!("Connection {} timeout waiting for CONNECT_ACK", conn_id);
                     let mut fin_frame = Frame::new_data(conn_id, 0, &[]).unwrap();
                     fin_frame.set_fin();
-                    let _ = session.write_queue_tx.send(fin_frame);
+                    let _ = session.write_queue_tx.send(fin_frame).await;
                     session.connection_registry.write().await.remove(&conn_id);
                     self.connection_manager.remove_connection(conn_id).await;
                     return Ok(());
@@ -1190,7 +1249,7 @@ impl SourceContainer {
             return Err(SourceError::ConfigError("Connection rejected".to_string()));
         }
 
-        conn.set_state(super::ConnectionState::Established).await;
+        conn.set_state(super::ConnectionState::Established);
 
         let conn_clone = conn.clone();
         let session_for_task = session.clone();
@@ -1205,14 +1264,14 @@ impl SourceContainer {
                             Ok(0) => {
                                 let mut close_frame = Frame::new_data(conn_clone.id(), 0, &[]).unwrap();
                                 close_frame.set_fin();
-                                let _ = session_for_task.write_queue_tx.send(close_frame);
+                                let _ = session_for_task.write_queue_tx.send(close_frame).await;
                                 break;
                             }
                             Ok(n) => {
-                                session_for_task.heartbeat_state.record_activity().await;
+                                session_for_task.heartbeat_state.record_activity();
 
                                 let frame = Frame::new_data(conn_clone.id(), 0, &buf[..n]).unwrap();
-                                if session_for_task.write_queue_tx.send(frame).is_err() {
+                                if session_for_task.write_queue_tx.send(frame).await.is_err() {
                                     tracing::error!("Session write queue closed, ending client handler");
                                     break;
                                 }
@@ -1228,7 +1287,7 @@ impl SourceContainer {
                     frame = rx_from_tunnel.recv() => {
                         match frame {
                             Some(f) => {
-                                session_for_task.heartbeat_state.record_activity().await;
+                                session_for_task.heartbeat_state.record_activity();
 
                                 if let Err(e) = stream.write_all(f.payload()).await {
                                     tracing::error!("Failed to write to client: {}", e);
@@ -1250,7 +1309,7 @@ impl SourceContainer {
                 let mut registry = session_for_task.connection_registry.write().await;
                 registry.remove(&conn_clone.id());
             }
-            conn_clone.set_state(super::ConnectionState::Closed).await;
+            conn_clone.set_state(super::ConnectionState::Closed);
             conn_manager.remove_connection(conn_clone.id()).await;
         });
 
@@ -1275,6 +1334,7 @@ impl SourceContainer {
             session
                 .write_queue_tx
                 .send(frame)
+                .await
                 .map_err(|_| SourceError::NotConnected)?;
             Ok(())
         } else {

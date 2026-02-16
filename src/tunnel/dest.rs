@@ -317,8 +317,8 @@ impl DestContainer {
             }
         });
 
+        let mut read_buf = Vec::with_capacity(8192);
         loop {
-            // Read frame length with timeout
             let len = match timeout(FRAME_READ_TIMEOUT, read_half.read_u32()).await {
                 Ok(Ok(l)) => l,
                 Ok(Err(e)) => {
@@ -333,7 +333,6 @@ impl DestContainer {
                 }
             };
 
-            // CRITICAL: Validate size before allocation to prevent memory exhaustion
             if len > MAX_FRAME_SIZE {
                 tracing::error!("Frame size {} exceeds maximum {}", len, MAX_FRAME_SIZE);
                 drop(response_tx);
@@ -348,9 +347,16 @@ impl DestContainer {
                 continue;
             }
 
-            // Read frame data with timeout
-            let mut buf = vec![0u8; len as usize];
-            match timeout(FRAME_READ_TIMEOUT, read_half.read_exact(&mut buf)).await {
+            let len_usize = len as usize;
+            if read_buf.len() < len_usize {
+                read_buf.resize(len_usize, 0);
+            }
+            match timeout(
+                FRAME_READ_TIMEOUT,
+                read_half.read_exact(&mut read_buf[..len_usize]),
+            )
+            .await
+            {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     tracing::error!("Failed to read frame: {}", e);
@@ -364,8 +370,7 @@ impl DestContainer {
                 }
             }
 
-            // Decode frame
-            let wire_frame = super::WireFrame::new(buf);
+            let wire_frame = super::WireFrame::new(read_buf[..len_usize].to_vec());
             let frame = match frame_codec.decode(&wire_frame) {
                 Ok(f) => f,
                 Err(e) => {
@@ -555,7 +560,8 @@ impl DestContainer {
                     }
                 };
 
-                // Create connection record
+                target_stream.set_nodelay(true).ok();
+
                 let parsed_addr = match target_addr.parse() {
                     Ok(addr) => addr,
                     Err(e) => {
@@ -614,7 +620,7 @@ impl DestContainer {
                             Ok(n) => {
                                 // Forward data from target to tunnel
                                 conn_clone.record_receive(n);
-                                conn_clone.touch().await;
+                                conn_clone.touch();
                                 if let Ok(data_frame) = Frame::new_data(connection_id, 0, &buf[..n])
                                 {
                                     if response_tx_clone.send(data_frame).is_err() {
@@ -675,17 +681,44 @@ impl DestContainer {
                 if let Some(target_conn) = target_conn {
                     let mut writer = target_conn.writer.lock().await;
                     if let Err(e) = writer.write_all(payload).await {
-                        tracing::error!("Failed to write to target {}: {}", connection_id, e);
-                        drop(writer);
-                        let mut connections = self.target_connections.write().await;
-                        connections.remove(&connection_id);
-                        connection_manager.remove_connection(connection_id).await;
-                    } else if let Err(e) = writer.flush().await {
-                        tracing::error!("Failed to flush target {}: {}", connection_id, e);
-                        drop(writer);
-                        let mut connections = self.target_connections.write().await;
-                        connections.remove(&connection_id);
-                        connection_manager.remove_connection(connection_id).await;
+                        let kind = e.kind();
+                        let is_transient = matches!(
+                            kind,
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::TimedOut
+                        );
+
+                        if is_transient {
+                            tracing::warn!(
+                                "Transient write error on target {}, retrying: {}",
+                                connection_id,
+                                e
+                            );
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            if let Err(e2) = writer.write_all(payload).await {
+                                tracing::error!(
+                                    "Retry failed for target {}: {}",
+                                    connection_id,
+                                    e2
+                                );
+                                drop(writer);
+                                let mut connections = self.target_connections.write().await;
+                                connections.remove(&connection_id);
+                                connection_manager.remove_connection(connection_id).await;
+                            } else {
+                                metrics.bytes_sent.fetch_add(
+                                    payload.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        } else {
+                            tracing::error!("Failed to write to target {}: {}", connection_id, e);
+                            drop(writer);
+                            let mut connections = self.target_connections.write().await;
+                            connections.remove(&connection_id);
+                            connection_manager.remove_connection(connection_id).await;
+                        }
                     } else {
                         metrics
                             .bytes_sent

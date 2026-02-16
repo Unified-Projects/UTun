@@ -1,0 +1,51 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "16777216"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-bench-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-target-
+
+      - name: Run crypto benchmarks
+        run: cargo bench --bench crypto_bench
+
+      - name: Run latency benchmarks
+        run: cargo bench --bench latency_bench

@@ -184,6 +184,7 @@ async fn test_single_port_end_to_end() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     // Start source
@@ -365,6 +366,7 @@ async fn test_multiple_ports_concurrent() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -497,6 +499,7 @@ async fn test_chaos_massive_concurrent_connections() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -629,6 +632,7 @@ async fn test_large_payload_transfer() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -762,6 +766,7 @@ async fn test_rapid_connection_churn() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -888,6 +893,7 @@ async fn test_race_condition_simultaneous_operations() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -1015,6 +1021,7 @@ async fn test_heavy_load_1000_connections() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -1146,6 +1153,7 @@ async fn test_memory_stress_sequential_connections() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -1257,6 +1265,7 @@ async fn test_interleaved_data_integrity() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();
@@ -1390,6 +1399,7 @@ async fn test_connection_drop_resilience() {
         ca_cert_path: cert_dir.path().join("ca.crt"),
         connection_refresh_interval_secs: 0,
         connection_drain_timeout_secs: 60,
+        write_queue_size: 8192,
     };
 
     let crypto_config = default_crypto_config();

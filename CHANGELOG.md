@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-16
+
 ### Added
 - `TunnelSession` abstraction encapsulating a complete tunnel connection (codec, writer, demux, heartbeat) with per-session shutdown, enabling concurrent sessions for blue-green refresh.
 - `TunnelRecoverySignal` channel replacing the dead `reconnection_needed` AtomicBool -- heartbeat, demux, and writer tasks now signal failures via typed messages (`HeartbeatDead`, `DemuxExited`, `WriterExited`).
@@ -16,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HeartbeatState::reset()` method for clearing all tracking fields.
 - `connection_refresh_interval_secs` and `connection_drain_timeout_secs` configuration fields on `SourceConfig`.
 - Comprehensive reconnection test suite (`tests/reconnection_tests.rs`) covering heartbeat recovery, demux/writer failure detection, full recovery cycles, blue-green zero-downtime refresh, drain timeout, circuit breaker integration, and backoff timing.
+- `write_queue_size` configuration field on `SourceConfig` (default 8192) for bounded write queue backpressure.
+- Transient error retry (single retry after 50ms) on dest target write path for WouldBlock, Interrupted, and TimedOut errors.
 
 ### Fixed
 - Heartbeat now **breaks** and signals recovery after `max_missed_pongs` consecutive timeouts instead of logging forever and setting a flag nobody reads.
@@ -31,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Writer task now owns `OwnedWriteHalf` directly instead of going through `Arc<Mutex<Option<OwnedWriteHalf>>>`, eliminating lock contention entirely.
 - `send_frame()` and `registry_count()` now route through the active session.
 - Removed `frame_codec`, `tunnel_stream`, `tunnel_read`, `tunnel_write`, `write_queue_tx`, `connection_registry`, `heartbeat_state`, `demux_handle`, `demux_watchdog`, and `reconnection_needed` fields from `SourceContainer`.
+- Source writer now batches pending frames via try_recv() and flushes once per batch instead of per-frame.
+- TCP_NODELAY set on source tunnel socket, client sockets, and dest target sockets for lower latency.
+- All crypto atomic orderings relaxed from SeqCst to Relaxed (nonce counter, sequence counters).
+- `HeartbeatState` replaced 5x `Arc<RwLock<T>>` fields with lock-free atomics using epoch-relative microsecond timestamps. All methods now synchronous.
+- `Connection.state` replaced `RwLock<ConnectionState>` with `AtomicU8`. `state()` and `set_state()` now synchronous.
+- `Connection.last_activity` replaced `RwLock<Instant>` with epoch-relative `AtomicU64`. `touch()` and `is_idle()` now synchronous.
+- `cleanup_stale()` now uses two-phase locking: read lock to identify stale IDs, write lock only for removal.
+- Per-frame flush removed from dest target data handler (TCP_NODELAY ensures immediacy).
+- Write queue changed from unbounded to bounded channel (configurable via `write_queue_size`). Heartbeat uses `try_send()` to avoid blocking on full queue.
+- Frame read buffers reused across iterations in both source demux and dest read loops to reduce per-frame heap allocations.
 
 ## [0.1.7] - 2026-02-15
 

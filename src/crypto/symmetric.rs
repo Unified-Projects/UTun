@@ -59,7 +59,7 @@ impl SymmetricCrypto {
     /// Generate a counter-based nonce: [4-byte session prefix][8-byte counter]
     fn generate_nonce(&self) -> Result<[u8; 12], SymmetricError> {
         // Use fetch_add to atomically increment and get the previous value
-        let counter = self.nonce_counter.fetch_add(1, Ordering::SeqCst);
+        let counter = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
 
         if counter == u64::MAX {
             return Err(SymmetricError::NonceCounterOverflow);
@@ -172,7 +172,7 @@ impl SessionCrypto {
             .map_err(|_| SymmetricError::EncryptionFailed)?;
 
         // Maintain outbound_seq for monitoring/metrics
-        self.outbound_seq.fetch_add(1, Ordering::SeqCst);
+        self.outbound_seq.fetch_add(1, Ordering::Relaxed);
 
         Ok(EncryptedFrame {
             nonce: nonce_bytes,
@@ -198,7 +198,7 @@ impl SessionCrypto {
             .decrypt(nonce, frame.ciphertext.as_ref());
 
         // Always increment counter regardless of success/failure for timing consistency
-        self.inbound_seq.fetch_add(1, Ordering::SeqCst);
+        self.inbound_seq.fetch_add(1, Ordering::Relaxed);
 
         match result {
             Ok(plaintext) => Ok(plaintext),
@@ -213,11 +213,11 @@ impl SessionCrypto {
     }
 
     pub fn outbound_seq(&self) -> u64 {
-        self.outbound_seq.load(Ordering::SeqCst)
+        self.outbound_seq.load(Ordering::Relaxed)
     }
 
     pub fn inbound_seq(&self) -> u64 {
-        self.inbound_seq.load(Ordering::SeqCst)
+        self.inbound_seq.load(Ordering::Relaxed)
     }
 }
 

@@ -77,7 +77,7 @@ tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "m
 
 # HTTP client for health checks
 reqwest = { version = "0.13.1", features = ["json"] }
-libc = "0.2.181"
+libc = "0.2.182"
 
 # Windows ACL checking
 [target.'cfg(windows)'.dependencies]

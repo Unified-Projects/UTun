@@ -233,7 +233,7 @@ jobs:
         run: docker build -t utun:test .
 
       - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # master
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # master
         with:
           image-ref: 'utun:test'
           format: 'table'

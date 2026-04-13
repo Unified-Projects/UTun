@@ -63,7 +63,7 @@ lru = "0.16"
 rand = "0.9"
 chrono = "0.4"
 ipnetwork = "0.21"
-socket2 = "0.6.2"
+socket2 = "0.6.3"
 
 # Metrics
 prometheus = "0.14"

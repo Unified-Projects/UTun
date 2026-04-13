@@ -752,6 +752,45 @@ impl HandshakeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::auth::{
+        generate_ca_certificate, generate_client_certificate, generate_server_certificate,
+    };
+
+    struct TestMaterial {
+        ca_cert: Vec<u8>,
+        server_cert: Vec<u8>,
+        server_key: Vec<u8>,
+        client_cert: Vec<u8>,
+        client_key: Vec<u8>,
+    }
+
+    fn generate_test_material(server_hostname: &str, client_common_name: &str) -> TestMaterial {
+        let ca = generate_ca_certificate("Test CA", 365).unwrap();
+        let server = generate_server_certificate(
+            &ca.certificate_pem,
+            ca.private_key_pem.expose_secret(),
+            server_hostname,
+            vec![server_hostname.to_string()],
+            vec!["127.0.0.1".to_string()],
+            365,
+        )
+        .unwrap();
+        let client = generate_client_certificate(
+            &ca.certificate_pem,
+            ca.private_key_pem.expose_secret(),
+            client_common_name,
+            365,
+        )
+        .unwrap();
+
+        TestMaterial {
+            ca_cert: ca.certificate_pem.into_bytes(),
+            server_cert: server.certificate_pem.into_bytes(),
+            server_key: server.private_key_pem.into_inner().into_bytes(),
+            client_cert: client.certificate_pem.into_bytes(),
+            client_key: client.private_key_pem.into_inner().into_bytes(),
+        }
+    }
 
     #[test]
     fn test_kem_algorithm_conversion() {
@@ -811,5 +850,132 @@ mod tests {
         assert!(hello.timestamp_ms > 0);
         assert!(hello.timestamp_ms >= before);
         assert!(hello.timestamp_ms <= after);
+    }
+
+    #[tokio::test]
+    async fn test_process_client_hello_rejects_stale_timestamp() {
+        let material = generate_test_material("server.example.com", "client.example.com");
+        let key_manager = Arc::new(KeyManager::new(3600, 1800));
+
+        let mut client_ctx = HandshakeContext::new_client(
+            key_manager.clone(),
+            material.client_cert,
+            material.client_key,
+            material.ca_cert.clone(),
+        );
+        let mut server_ctx = HandshakeContext::new_server(
+            key_manager,
+            material.server_cert,
+            material.server_key,
+            material.ca_cert,
+        );
+
+        let mut client_hello = client_ctx.create_client_hello().unwrap();
+        client_hello.timestamp_ms = current_timestamp_ms() - 31_000;
+
+        let err = server_ctx
+            .process_client_hello(client_hello)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::ReplayDetected));
+    }
+
+    #[tokio::test]
+    async fn test_process_server_hello_rejects_hostname_mismatch() {
+        let material = generate_test_material("server.example.com", "client.example.com");
+        let key_manager = Arc::new(KeyManager::new(3600, 1800));
+
+        let mut client_ctx = HandshakeContext::new_client_with_hostname(
+            key_manager.clone(),
+            material.client_cert,
+            material.client_key,
+            material.ca_cert.clone(),
+            "unexpected.example.com".to_string(),
+        );
+        let mut server_ctx = HandshakeContext::new_server(
+            key_manager,
+            material.server_cert,
+            material.server_key,
+            material.ca_cert,
+        );
+
+        let client_hello = client_ctx.create_client_hello().unwrap();
+        let server_hello = server_ctx.process_client_hello(client_hello).await.unwrap();
+
+        let err = client_ctx
+            .process_server_hello(server_hello)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HandshakeError::HostnameVerificationFailed { expected }
+                if expected == "unexpected.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_process_client_finished_rejects_untrusted_client_certificate() {
+        let trusted_material = generate_test_material("server.example.com", "trusted-client");
+        let rogue_material = generate_test_material("rogue-server.example.com", "rogue-client");
+        let key_manager = Arc::new(KeyManager::new(3600, 1800));
+
+        let mut client_ctx = HandshakeContext::new_client(
+            key_manager.clone(),
+            rogue_material.client_cert,
+            rogue_material.client_key,
+            trusted_material.ca_cert.clone(),
+        );
+        let mut server_ctx = HandshakeContext::new_server(
+            key_manager,
+            trusted_material.server_cert,
+            trusted_material.server_key,
+            trusted_material.ca_cert,
+        );
+
+        let client_hello = client_ctx.create_client_hello().unwrap();
+        let server_hello = server_ctx.process_client_hello(client_hello).await.unwrap();
+        let client_finished = client_ctx.process_server_hello(server_hello).await.unwrap();
+
+        let err = server_ctx
+            .process_client_finished(client_finished)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::CertVerificationFailed));
+    }
+
+    #[tokio::test]
+    async fn test_process_server_finished_rejects_bad_verify_data() {
+        let material = generate_test_material("server.example.com", "client.example.com");
+        let key_manager = Arc::new(KeyManager::new(3600, 1800));
+
+        let mut client_ctx = HandshakeContext::new_client(
+            key_manager.clone(),
+            material.client_cert,
+            material.client_key,
+            material.ca_cert.clone(),
+        );
+        let mut server_ctx = HandshakeContext::new_server(
+            key_manager,
+            material.server_cert,
+            material.server_key,
+            material.ca_cert,
+        );
+
+        let client_hello = client_ctx.create_client_hello().unwrap();
+        let server_hello = server_ctx.process_client_hello(client_hello).await.unwrap();
+        let client_finished = client_ctx.process_server_hello(server_hello).await.unwrap();
+        let mut server_finished = server_ctx
+            .process_client_finished(client_finished)
+            .await
+            .unwrap();
+
+        server_finished.verify_data[0] ^= 0x01;
+
+        let err = client_ctx
+            .process_server_finished(server_finished)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandshakeError::VerificationFailed));
+        assert_eq!(client_ctx.state(), HandshakeState::Failed);
     }
 }

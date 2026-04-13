@@ -602,6 +602,14 @@ async fn start_metrics_server(bind_ip: String, port: u16, health_monitor: Shared
         "127.0.0.1".parse().unwrap()
     });
 
+    if !addr.is_loopback() {
+        tracing::error!(
+            "Refusing to expose metrics and health endpoints on non-loopback address {}",
+            addr
+        );
+        return;
+    }
+
     tracing::info!("Starting metrics server on {}:{}", addr, port);
     warp::serve(routes).run((addr, port)).await;
 }

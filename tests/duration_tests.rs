@@ -63,6 +63,29 @@ fn create_test_certs(dir: &Path) {
     .unwrap();
 }
 
+#[derive(Clone, Copy)]
+struct TestPorts {
+    backend: u16,
+    tunnel: u16,
+    listen: u16,
+}
+
+fn reserve_test_ports() -> TestPorts {
+    fn reserve_one() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    TestPorts {
+        backend: reserve_one(),
+        tunnel: reserve_one(),
+        listen: reserve_one(),
+    }
+}
+
 async fn start_echo_server(port: u16) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
 
@@ -213,11 +236,19 @@ async fn test_sustained_traffic_5min() {
 
     let cert_dir = tempdir().unwrap();
     create_test_certs(cert_dir.path());
+    let ports = reserve_test_ports();
 
-    let _echo = start_echo_server(29001).await.unwrap();
+    let _echo = start_echo_server(ports.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (source, dest) = setup_full_stack(29001, 29011, 29021, cert_dir.path(), 1000).await;
+    let (source, dest) = setup_full_stack(
+        ports.backend,
+        ports.tunnel,
+        ports.listen,
+        cert_dir.path(),
+        1000,
+    )
+    .await;
 
     let test_duration = Duration::from_secs(5 * 60);
     let num_clients = 10;
@@ -267,7 +298,7 @@ async fn test_sustained_traffic_5min() {
         let handle = tokio::spawn(async move {
             let connect_result = timeout(
                 Duration::from_secs(10),
-                TcpStream::connect("127.0.0.1:29021"),
+                TcpStream::connect(("127.0.0.1", ports.listen)),
             )
             .await;
 
@@ -365,7 +396,7 @@ async fn test_sustained_traffic_5min() {
     // Final verification: fresh connection still works
     let mut verify_client = timeout(
         Duration::from_secs(10),
-        TcpStream::connect("127.0.0.1:29021"),
+        TcpStream::connect(("127.0.0.1", ports.listen)),
     )
     .await
     .expect("Final verification connect timed out")
@@ -415,11 +446,19 @@ async fn test_idle_resilience_5min() {
 
     let cert_dir = tempdir().unwrap();
     create_test_certs(cert_dir.path());
+    let ports = reserve_test_ports();
 
-    let _echo = start_echo_server(29002).await.unwrap();
+    let _echo = start_echo_server(ports.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (source, dest) = setup_full_stack(29002, 29012, 29022, cert_dir.path(), 1000).await;
+    let (source, dest) = setup_full_stack(
+        ports.backend,
+        ports.tunnel,
+        ports.listen,
+        cert_dir.path(),
+        1000,
+    )
+    .await;
 
     let test_duration = Duration::from_secs(5 * 60);
     let check_interval = Duration::from_secs(30);
@@ -438,7 +477,7 @@ async fn test_idle_resilience_5min() {
         let probe_result: Result<(), String> = async {
             let mut client = timeout(
                 Duration::from_secs(10),
-                TcpStream::connect("127.0.0.1:29022"),
+                TcpStream::connect(("127.0.0.1", ports.listen)),
             )
             .await
             .map_err(|_| "connect timed out".to_string())?
@@ -513,11 +552,19 @@ async fn test_stress_sustained_load() {
 
     let cert_dir = tempdir().unwrap();
     create_test_certs(cert_dir.path());
+    let ports = reserve_test_ports();
 
-    let _echo = start_echo_server(29003).await.unwrap();
+    let _echo = start_echo_server(ports.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (source, dest) = setup_full_stack(29003, 29013, 29023, cert_dir.path(), 5000).await;
+    let (source, dest) = setup_full_stack(
+        ports.backend,
+        ports.tunnel,
+        ports.listen,
+        cert_dir.path(),
+        5000,
+    )
+    .await;
 
     let test_duration = Duration::from_secs(3 * 60);
     let wave_interval = Duration::from_secs(5);
@@ -570,7 +617,7 @@ async fn test_stress_sustained_load() {
             let handle = tokio::spawn(async move {
                 let connect_result = timeout(
                     Duration::from_secs(15),
-                    TcpStream::connect("127.0.0.1:29023"),
+                    TcpStream::connect(("127.0.0.1", ports.listen)),
                 )
                 .await;
 
@@ -700,7 +747,7 @@ async fn test_stress_sustained_load() {
     // Final verification: tunnel still responsive
     let mut verify_client = timeout(
         Duration::from_secs(10),
-        TcpStream::connect("127.0.0.1:29023"),
+        TcpStream::connect(("127.0.0.1", ports.listen)),
     )
     .await
     .expect("Final verification connect timed out - tunnel is dead")
@@ -755,11 +802,19 @@ async fn test_sustained_traffic_30min() {
 
     let cert_dir = tempdir().unwrap();
     create_test_certs(cert_dir.path());
+    let ports = reserve_test_ports();
 
-    let _echo = start_echo_server(29101).await.unwrap();
+    let _echo = start_echo_server(ports.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (source, dest) = setup_full_stack(29101, 29111, 29121, cert_dir.path(), 1000).await;
+    let (source, dest) = setup_full_stack(
+        ports.backend,
+        ports.tunnel,
+        ports.listen,
+        cert_dir.path(),
+        1000,
+    )
+    .await;
 
     let test_duration = Duration::from_secs(30 * 60);
     let num_clients = 10;
@@ -807,7 +862,7 @@ async fn test_sustained_traffic_30min() {
         let handle = tokio::spawn(async move {
             let connect_result = timeout(
                 Duration::from_secs(10),
-                TcpStream::connect("127.0.0.1:29121"),
+                TcpStream::connect(("127.0.0.1", ports.listen)),
             )
             .await;
 
@@ -900,7 +955,7 @@ async fn test_sustained_traffic_30min() {
 
     let mut verify_client = timeout(
         Duration::from_secs(10),
-        TcpStream::connect("127.0.0.1:29121"),
+        TcpStream::connect(("127.0.0.1", ports.listen)),
     )
     .await
     .expect("Final verification connect timed out")
@@ -943,11 +998,19 @@ async fn test_idle_resilience_30min() {
 
     let cert_dir = tempdir().unwrap();
     create_test_certs(cert_dir.path());
+    let ports = reserve_test_ports();
 
-    let _echo = start_echo_server(29102).await.unwrap();
+    let _echo = start_echo_server(ports.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (source, dest) = setup_full_stack(29102, 29112, 29122, cert_dir.path(), 1000).await;
+    let (source, dest) = setup_full_stack(
+        ports.backend,
+        ports.tunnel,
+        ports.listen,
+        cert_dir.path(),
+        1000,
+    )
+    .await;
 
     let test_duration = Duration::from_secs(30 * 60);
     let check_interval = Duration::from_secs(30);
@@ -964,7 +1027,7 @@ async fn test_idle_resilience_30min() {
         let probe_result: Result<(), String> = async {
             let mut client = timeout(
                 Duration::from_secs(10),
-                TcpStream::connect("127.0.0.1:29122"),
+                TcpStream::connect(("127.0.0.1", ports.listen)),
             )
             .await
             .map_err(|_| "connect timed out".to_string())?
@@ -1036,11 +1099,19 @@ async fn test_stress_sustained_load_30min() {
 
     let cert_dir = tempdir().unwrap();
     create_test_certs(cert_dir.path());
+    let ports = reserve_test_ports();
 
-    let _echo = start_echo_server(29103).await.unwrap();
+    let _echo = start_echo_server(ports.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (source, dest) = setup_full_stack(29103, 29113, 29123, cert_dir.path(), 10000).await;
+    let (source, dest) = setup_full_stack(
+        ports.backend,
+        ports.tunnel,
+        ports.listen,
+        cert_dir.path(),
+        10000,
+    )
+    .await;
 
     let test_duration = Duration::from_secs(30 * 60);
     let wave_interval = Duration::from_secs(5);
@@ -1090,7 +1161,7 @@ async fn test_stress_sustained_load_30min() {
             let handle = tokio::spawn(async move {
                 let connect_result = timeout(
                     Duration::from_secs(15),
-                    TcpStream::connect("127.0.0.1:29123"),
+                    TcpStream::connect(("127.0.0.1", ports.listen)),
                 )
                 .await;
 
@@ -1215,7 +1286,7 @@ async fn test_stress_sustained_load_30min() {
 
     let mut verify_client = timeout(
         Duration::from_secs(10),
-        TcpStream::connect("127.0.0.1:29123"),
+        TcpStream::connect(("127.0.0.1", ports.listen)),
     )
     .await
     .expect("Final verification connect timed out - tunnel is dead")

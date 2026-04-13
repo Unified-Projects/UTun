@@ -81,6 +81,13 @@ pub struct PortListener {
     pub listener: TcpListener,
 }
 
+#[derive(Clone)]
+struct ClientHandshakeMaterial {
+    client_cert: Arc<[u8]>,
+    client_key: Arc<[u8]>,
+    ca_cert: Arc<[u8]>,
+}
+
 #[derive(Default)]
 #[allow(dead_code)] // Used by multi-port listener mode
 pub struct ListenerManager {
@@ -443,6 +450,7 @@ pub struct SourceContainer {
     recovery_tx: mpsc::UnboundedSender<TunnelRecoverySignal>,
     recovery_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<TunnelRecoverySignal>>>>,
     session_counter: Arc<AtomicU64>,
+    handshake_material: ClientHandshakeMaterial,
 }
 
 impl SourceContainer {
@@ -450,6 +458,7 @@ impl SourceContainer {
         config: SourceConfig,
         crypto_config: CryptoConfig,
     ) -> Result<Self, SourceError> {
+        let handshake_material = load_client_handshake_material(&config)?;
         let key_manager = Arc::new(KeyManager::new(3600, 300)); // 1 hour rotation, 5 min window
         let connection_manager = Arc::new(ConnectionManager::new_with_channel_size(
             config.max_connections,
@@ -488,6 +497,7 @@ impl SourceContainer {
             recovery_tx,
             recovery_rx: Arc::new(Mutex::new(Some(recovery_rx))),
             session_counter: Arc::new(AtomicU64::new(1)),
+            handshake_material,
         })
     }
 
@@ -631,6 +641,12 @@ impl SourceContainer {
             .set_status(HealthStatus::Connecting)
             .await;
         let stream = TcpStream::connect(&dest_addr).await?;
+        if self.config.keep_alive_interval_ms > 0 {
+            let sock_ref = socket2::SockRef::from(&stream);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_millis(self.config.keep_alive_interval_ms));
+            sock_ref.set_tcp_keepalive(&keepalive)?;
+        }
         stream.set_nodelay(true).ok();
         Ok(stream)
     }
@@ -639,26 +655,12 @@ impl SourceContainer {
         &self,
         mut stream: TcpStream,
     ) -> Result<(Arc<FrameCodec>, OwnedReadHalf, OwnedWriteHalf), SourceError> {
-        use crate::crypto::file_access::validate_file_access;
-        validate_file_access(
-            &self.config.client_cert_path,
-            &self.config.client_key_path,
-            "client",
-        )
-        .map_err(|e| SourceError::ConfigError(e.to_string()))?;
-
-        let client_cert = std::fs::read(&self.config.client_cert_path)
-            .map_err(|e| SourceError::ConfigError(format!("Failed to read client cert: {}", e)))?;
-        let client_key = std::fs::read(&self.config.client_key_path)
-            .map_err(|e| SourceError::ConfigError(format!("Failed to read client key: {}", e)))?;
-        let ca_cert = std::fs::read(&self.config.ca_cert_path)
-            .map_err(|e| SourceError::ConfigError(format!("Failed to read CA cert: {}", e)))?;
-
-        let mut handshake_ctx = HandshakeContext::new_client(
+        let mut handshake_ctx = HandshakeContext::new_client_with_hostname(
             self.key_manager.clone(),
-            client_cert,
-            client_key,
-            ca_cert,
+            self.handshake_material.client_cert.as_ref().to_vec(),
+            self.handshake_material.client_key.as_ref().to_vec(),
+            self.handshake_material.ca_cert.as_ref().to_vec(),
+            self.config.dest_host.clone(),
         );
 
         let client_hello = handshake_ctx
@@ -1328,6 +1330,16 @@ impl SourceContainer {
         }
     }
 
+    pub async fn active_session_id(&self) -> Option<u64> {
+        let guard = self.active_session.read().await;
+        guard.as_ref().map(|session| session.session_id)
+    }
+
+    pub async fn retiring_session_count(&self) -> usize {
+        let guard = self.retiring_sessions.lock().await;
+        guard.len()
+    }
+
     pub async fn send_frame(&self, frame: Frame) -> Result<(), SourceError> {
         let guard = self.active_session.read().await;
         if let Some(ref session) = *guard {
@@ -1375,8 +1387,9 @@ impl SourceContainer {
         refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         refresh_timer.tick().await;
 
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<(TcpStream, SocketAddr, u16, Protocol)>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(TcpStream, SocketAddr, u16, Protocol)>(
+            self.config.connection_channel_size,
+        );
 
         let mut listener_handles = Vec::new();
 
@@ -1393,7 +1406,7 @@ impl SourceContainer {
                         result = listener.accept() => {
                             match result {
                                 Ok((stream, addr)) => {
-                                    if tx_clone.send((stream, addr, port, protocol)).is_err() {
+                                    if tx_clone.send((stream, addr, port, protocol)).await.is_err() {
                                         tracing::error!("Failed to send accepted connection to channel");
                                         break;
                                     }
@@ -1536,6 +1549,154 @@ impl Clone for SourceContainer {
             recovery_tx: self.recovery_tx.clone(),
             recovery_rx: self.recovery_rx.clone(),
             session_counter: self.session_counter.clone(),
+            handshake_material: self.handshake_material.clone(),
         }
+    }
+}
+
+fn load_client_handshake_material(
+    config: &SourceConfig,
+) -> Result<ClientHandshakeMaterial, SourceError> {
+    use crate::crypto::file_access::validate_file_access;
+
+    validate_file_access(&config.client_cert_path, &config.client_key_path, "client")
+        .map_err(|e| SourceError::ConfigError(e.to_string()))?;
+
+    let client_cert = std::fs::read(&config.client_cert_path)
+        .map_err(|e| SourceError::ConfigError(format!("Failed to read client cert: {}", e)))?;
+    let client_key = std::fs::read(&config.client_key_path)
+        .map_err(|e| SourceError::ConfigError(format!("Failed to read client key: {}", e)))?;
+    let ca_cert = std::fs::read(&config.ca_cert_path)
+        .map_err(|e| SourceError::ConfigError(format!("Failed to read CA cert: {}", e)))?;
+
+    Ok(ClientHandshakeMaterial {
+        client_cert: Arc::<[u8]>::from(client_cert),
+        client_key: Arc::<[u8]>::from(client_key),
+        ca_cert: Arc::<[u8]>::from(ca_cert),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AllowedOutboundConfig, CryptoConfig, ExposedPortConfig, KemMode,
+        Protocol as ConfigProtocol, SourceMode,
+    };
+    use crate::crypto::auth::{generate_ca_certificate, generate_client_certificate};
+    use socket2::SockRef;
+    use std::path::Path;
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+
+    fn create_test_certs(dir: &Path) {
+        let ca = generate_ca_certificate("Test CA", 365).unwrap();
+        std::fs::write(dir.join("ca.crt"), &ca.certificate_pem).unwrap();
+        std::fs::write(dir.join("ca.key"), ca.private_key_pem.expose_secret()).unwrap();
+
+        let client = generate_client_certificate(
+            &ca.certificate_pem,
+            ca.private_key_pem.expose_secret(),
+            "test-client",
+            365,
+        )
+        .unwrap();
+        std::fs::write(dir.join("client.crt"), &client.certificate_pem).unwrap();
+        std::fs::write(
+            dir.join("client.key"),
+            client.private_key_pem.expose_secret(),
+        )
+        .unwrap();
+    }
+
+    fn test_source_config(
+        cert_dir: &Path,
+        dest_tunnel_port: u16,
+        keepalive_ms: u64,
+    ) -> SourceConfig {
+        SourceConfig {
+            listen_ip: "127.0.0.1".to_string(),
+            listen_port: 0,
+            mode: SourceMode::Transparent,
+            dest_host: "127.0.0.1".to_string(),
+            dest_tunnel_port,
+            max_connections: 16,
+            connection_timeout_ms: 5000,
+            keep_alive_interval_ms: keepalive_ms,
+            heartbeat_interval_ms: 1000,
+            heartbeat_timeout_ms: 500,
+            max_missed_pongs: 3,
+            reconnection_enabled: true,
+            max_reconnect_attempts: 3,
+            initial_reconnect_delay_ms: 10,
+            max_reconnect_delay_ms: 20,
+            frame_buffer_size: 8192,
+            connection_channel_size: 16,
+            circuit_breaker_window_secs: 30,
+            circuit_breaker_max_restarts: 3,
+            allowed_outbound: AllowedOutboundConfig::default(),
+            exposed_ports: vec![ExposedPortConfig {
+                port: 0,
+                protocol: ConfigProtocol::Tcp,
+            }],
+            write_queue_size: 8192,
+            connection_refresh_interval_secs: 0,
+            connection_drain_timeout_secs: 0,
+            client_cert_path: cert_dir.join("client.crt"),
+            client_key_path: cert_dir.join("client.key"),
+            ca_cert_path: cert_dir.join("ca.crt"),
+        }
+    }
+
+    fn test_crypto_config() -> CryptoConfig {
+        CryptoConfig {
+            kem_mode: KemMode::Mlkem768,
+            key_rotation_interval_seconds: 3600,
+            rehandshake_before_expiry_seconds: 300,
+            max_handshake_size: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_should_enable_keepalive_from_config() {
+        let cert_dir = tempdir().unwrap();
+        create_test_certs(cert_dir.path());
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("failed to bind test listener");
+        let dest_tunnel_port = listener.local_addr().unwrap().port();
+
+        let accept_task = tokio::spawn(async move {
+            let _ = listener
+                .accept()
+                .await
+                .expect("failed to accept test connection");
+        });
+
+        let source = SourceContainer::new(
+            test_source_config(cert_dir.path(), dest_tunnel_port, 9000),
+            test_crypto_config(),
+        )
+        .await
+        .expect("failed to create source container");
+
+        let stream = source
+            .connect_tcp()
+            .await
+            .expect("failed to connect to test listener");
+        let sock_ref = SockRef::from(&stream);
+
+        assert!(
+            stream.nodelay().unwrap(),
+            "connect_tcp must preserve TCP_NODELAY"
+        );
+        assert!(
+            sock_ref.keepalive().unwrap(),
+            "connect_tcp must enable SO_KEEPALIVE"
+        );
+
+        drop(stream);
+        let _ = accept_task.await;
     }
 }

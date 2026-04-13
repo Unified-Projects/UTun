@@ -234,9 +234,265 @@ async fn verify_echo(listen_port: u16, test_data: &[u8]) -> bool {
     matches!(result, Ok(Some(true)))
 }
 
+async fn wait_for_blue_green_refresh_and_drain(
+    source: &SourceContainer,
+    initial_session_id: u64,
+    timeout_duration: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let active_session_id = source.active_session_id().await;
+        let retiring_session_count = source.retiring_session_count().await;
+
+        if let Some(active_session_id) = active_session_id {
+            if active_session_id != initial_session_id && retiring_session_count == 0 {
+                return true;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn reserve_three_test_ports() -> (u16, u16, u16) {
+    let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tunnel = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+    let ports = (
+        backend.local_addr().unwrap().port(),
+        tunnel.local_addr().unwrap().port(),
+        listen.local_addr().unwrap().port(),
+    );
+
+    drop(backend);
+    drop(tunnel);
+    drop(listen);
+
+    ports
+}
+
+async fn start_stack_with_target_connect_timeout(
+    cert_dir: &Path,
+    echo_port: u16,
+    tunnel_port: u16,
+    listen_port: u16,
+    target_connect_timeout_ms: u64,
+) -> (Arc<SourceContainer>, Arc<DestContainer>) {
+    let mut dest_config = make_dest_config(cert_dir, tunnel_port, echo_port, listen_port);
+    dest_config.target_connect_timeout_ms = target_connect_timeout_ms;
+
+    let dest = Arc::new(
+        DestContainer::new(dest_config, default_crypto_config())
+            .await
+            .unwrap(),
+    );
+    dest.start().await.unwrap();
+    let dest_clone = dest.clone();
+    tokio::spawn(async move {
+        let _ = dest_clone.run().await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let source_config = make_source_config(cert_dir, listen_port, tunnel_port, false, 0, 30);
+    let source = Arc::new(
+        SourceContainer::new(source_config, default_crypto_config())
+            .await
+            .unwrap(),
+    );
+    source.start().await.unwrap();
+    let source_clone = source.clone();
+    tokio::spawn(async move {
+        let _ = source_clone.run().await;
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    (source, dest)
+}
+
+async fn client_round_trip(listen_port: u16, test_data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", listen_port)).await?;
+    client.write_all(test_data).await?;
+
+    let mut buf = vec![0u8; test_data.len()];
+    client.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn start_single_accept_server(
+    port: u16,
+) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+
+    let handle = tokio::spawn(async move {
+        if let Ok((socket, _)) = listener.accept().await {
+            drop(listener);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(socket);
+        }
+    });
+
+    Ok(handle)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_port_watcher_recovers_when_backend_returns_before_timeout() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let cert_dir = tempdir().unwrap();
+    create_test_certs(cert_dir.path());
+
+    let (backend_port, tunnel_port, listen_port) = reserve_three_test_ports();
+    let (source, dest) = start_stack_with_target_connect_timeout(
+        cert_dir.path(),
+        backend_port,
+        tunnel_port,
+        listen_port,
+        3_000,
+    )
+    .await;
+
+    let payload = b"PORT_WATCHER_BACKEND_RECOVERS".to_vec();
+    let client_task = tokio::spawn({
+        let payload = payload.clone();
+        async move {
+            timeout(
+                Duration::from_secs(6),
+                client_round_trip(listen_port, &payload),
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    let (echo_handle, echo_running) = start_echo_server(backend_port).await.unwrap();
+
+    let result = client_task.await.unwrap();
+    match result {
+        Ok(Ok(response)) => assert_eq!(response, payload),
+        Ok(Err(err)) => panic!("client should have succeeded after backend recovery: {err}"),
+        Err(_) => panic!("client timed out waiting for backend recovery"),
+    }
+
+    source.stop().await;
+    dest.stop().await;
+    echo_running.store(false, Ordering::Relaxed);
+    let _ = timeout(Duration::from_secs(1), echo_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_port_watcher_times_out_while_backend_stays_down() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let cert_dir = tempdir().unwrap();
+    create_test_certs(cert_dir.path());
+
+    let (backend_port, tunnel_port, listen_port) = reserve_three_test_ports();
+    let (source, dest) = start_stack_with_target_connect_timeout(
+        cert_dir.path(),
+        backend_port,
+        tunnel_port,
+        listen_port,
+        1_500,
+    )
+    .await;
+
+    let started_at = std::time::Instant::now();
+    let result = timeout(
+        Duration::from_secs(4),
+        client_round_trip(listen_port, b"PORT_WATCHER_TIMEOUT"),
+    )
+    .await;
+    let elapsed = started_at.elapsed();
+
+    match result {
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("client unexpectedly succeeded while backend remained unavailable"),
+        Err(_) => panic!("client round trip hung instead of timing out cleanly"),
+    }
+
+    assert!(
+        elapsed >= Duration::from_millis(1_000),
+        "failure returned too quickly to have waited for port readiness: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "failure took too long for a 1500ms target timeout: {:?}",
+        elapsed
+    );
+
+    source.stop().await;
+    dest.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_port_watcher_retries_after_false_ready_signal() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let cert_dir = tempdir().unwrap();
+    create_test_certs(cert_dir.path());
+
+    let (backend_port, tunnel_port, listen_port) = reserve_three_test_ports();
+    let (source, dest) = start_stack_with_target_connect_timeout(
+        cert_dir.path(),
+        backend_port,
+        tunnel_port,
+        listen_port,
+        3_000,
+    )
+    .await;
+
+    let first_attempt = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(6),
+            client_round_trip(listen_port, b"PORT_WATCHER_FALSE_READY"),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    let single_accept = start_single_accept_server(backend_port).await.unwrap();
+
+    match first_attempt.await.unwrap() {
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("first client unexpectedly succeeded through the false-ready backend"),
+        Err(_) => panic!("first client hung instead of failing after the false-ready signal"),
+    }
+
+    let _ = timeout(Duration::from_secs(1), single_accept).await;
+
+    let (echo_handle, echo_running) = start_echo_server(backend_port).await.unwrap();
+    assert!(
+        verify_echo(listen_port, b"PORT_WATCHER_RECOVERS_AFTER_FALSE_READY").await,
+        "port watcher should recover on a later backend availability cycle"
+    );
+
+    source.stop().await;
+    dest.stop().await;
+    echo_running.store(false, Ordering::Relaxed);
+    let _ = timeout(Duration::from_secs(1), echo_handle).await;
+}
 
 /// Test that heartbeat triggers recovery signal and reconnects
 /// when the destination becomes unreachable.
@@ -860,7 +1116,9 @@ async fn test_blue_green_drain_timeout() {
     // Short drain timeout (2s), refresh interval large enough for single refresh
     let source_config = make_source_config(cert_dir.path(), listen_port, tunnel_port, true, 30, 2);
 
-    let dest_config = make_dest_config(cert_dir.path(), tunnel_port, echo_port, listen_port);
+    let mut dest_config = make_dest_config(cert_dir.path(), tunnel_port, echo_port, listen_port);
+    dest_config.connection_timeout_ms = 180_000;
+    dest_config.stale_cleanup_interval_secs = 180;
     let dest = Arc::new(
         DestContainer::new(dest_config, default_crypto_config())
             .await
@@ -885,6 +1143,11 @@ async fn test_blue_green_drain_timeout() {
     });
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    let initial_session_id = source
+        .active_session_id()
+        .await
+        .expect("Source should have an active session before testing drain timeout");
+
     // Open a persistent connection
     let mut client = timeout(
         Duration::from_secs(3),
@@ -899,8 +1162,24 @@ async fn test_blue_green_drain_timeout() {
     client.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"DRAIN_TEST");
 
-    // Wait for refresh (30s) + handshake (~10s) + drain timeout (2s) + margin
-    tokio::time::sleep(Duration::from_secs(47)).await;
+    assert!(
+        wait_for_blue_green_refresh_and_drain(&source, initial_session_id, Duration::from_secs(90))
+            .await,
+        "Timed out waiting for blue-green refresh to complete and the old session to retire"
+    );
+
+    let old_conn_still_works = timeout(Duration::from_secs(3), async {
+        client.write_all(b"OLD_AFTER_DRAIN").await.ok()?;
+        let mut buf = vec![0u8; 15];
+        client.read_exact(&mut buf).await.ok()?;
+        Some(buf == b"OLD_AFTER_DRAIN".to_vec())
+    })
+    .await;
+
+    assert!(
+        !matches!(old_conn_still_works, Ok(Some(true))),
+        "Old session connection should be closed after drain timeout"
+    );
 
     // After drain timeout, old session should be forcibly closed
     // New connections should still work on the new session

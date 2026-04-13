@@ -1,5 +1,6 @@
 use ipnetwork::IpNetwork;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -24,6 +25,7 @@ pub struct Config {
     pub dest: Option<DestConfig>,
     pub auth: AuthConfig,
     pub crypto: CryptoConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
 }
@@ -282,6 +284,7 @@ pub struct ConnectionFilterConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 #[allow(dead_code)] // Config fields loaded from TOML
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
@@ -292,6 +295,16 @@ pub struct LoggingConfig {
 
     #[serde(default = "default_timestamp")]
     pub include_timestamp: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+            include_timestamp: default_timestamp(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,7 +436,7 @@ fn default_connection_drain_timeout() -> u64 {
 /// Load configuration from file
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let content = fs::read_to_string(path)?;
-    let mut config: Config = toml::from_str(&content)?;
+    let mut config = parse_config(&content)?;
 
     // Populate backwards compatibility fields
     if let Some(ref mut source) = config.source {
@@ -442,6 +455,205 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+fn parse_config(content: &str) -> Result<Config, ConfigError> {
+    match toml::from_str(content) {
+        Ok(config) => Ok(config),
+        Err(original_err) => {
+            let Some(normalized) = normalize_config_layout(content) else {
+                return Err(original_err.into());
+            };
+
+            toml::from_str(&normalized).map_err(Into::into)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TomlHeaderKind {
+    Table,
+    ArrayTable,
+}
+
+#[derive(Debug, Clone)]
+struct TomlSectionBlock {
+    kind: TomlHeaderKind,
+    key: String,
+    header_line: String,
+    body_lines: Vec<String>,
+}
+
+fn normalize_config_layout(content: &str) -> Option<String> {
+    let mut preamble = Vec::new();
+    let mut blocks = Vec::new();
+    let mut current: Option<TomlSectionBlock> = None;
+
+    for line in content.lines() {
+        if let Some((kind, key)) = parse_toml_header(line) {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+
+            current = Some(TomlSectionBlock {
+                kind,
+                key,
+                header_line: line.to_string(),
+                body_lines: Vec::new(),
+            });
+        } else if let Some(block) = current.as_mut() {
+            block.body_lines.push(line.to_string());
+        } else {
+            preamble.push(line.to_string());
+        }
+    }
+
+    if let Some(block) = current.take() {
+        blocks.push(block);
+    }
+
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut known_tables: HashMap<String, Vec<TomlSectionBlock>> = HashMap::new();
+    let mut unknown_blocks = Vec::new();
+
+    for block in blocks {
+        if is_supported_config_header(&block.key) {
+            known_tables
+                .entry(block.key.clone())
+                .or_default()
+                .push(block);
+        } else {
+            unknown_blocks.push(block);
+        }
+    }
+
+    let mut normalized_lines = preamble;
+    let mut changed = false;
+
+    for (key, expected_kind) in config_header_order() {
+        let Some(group) = known_tables.remove(*key) else {
+            continue;
+        };
+
+        if group.len() > 1 {
+            changed = true;
+        }
+
+        match expected_kind {
+            TomlHeaderKind::Table => {
+                let mut iter = group.into_iter();
+                if let Some(first) = iter.next() {
+                    if first.kind != *expected_kind {
+                        unknown_blocks.push(first);
+                        continue;
+                    }
+
+                    normalized_lines.push(first.header_line);
+                    normalized_lines.extend(first.body_lines);
+
+                    for block in iter {
+                        if block.kind != *expected_kind {
+                            unknown_blocks.push(block);
+                            continue;
+                        }
+                        normalized_lines.extend(block.body_lines);
+                    }
+                }
+            }
+            TomlHeaderKind::ArrayTable => {
+                for block in group {
+                    if block.kind != *expected_kind {
+                        unknown_blocks.push(block);
+                        continue;
+                    }
+
+                    normalized_lines.push(block.header_line);
+                    normalized_lines.extend(block.body_lines);
+                }
+            }
+        }
+    }
+
+    if !known_tables.is_empty() || !unknown_blocks.is_empty() {
+        changed = true;
+    }
+
+    for block in unknown_blocks {
+        normalized_lines.push(block.header_line);
+        normalized_lines.extend(block.body_lines);
+    }
+
+    for (_, blocks) in known_tables {
+        for block in blocks {
+            normalized_lines.push(block.header_line);
+            normalized_lines.extend(block.body_lines);
+        }
+    }
+
+    let mut normalized = normalized_lines.join("\n");
+    if content.ends_with('\n') {
+        normalized.push('\n');
+    }
+
+    if !changed && normalized == content {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn parse_toml_header(line: &str) -> Option<(TomlHeaderKind, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let without_comment = trimmed
+        .split_once('#')
+        .map(|(before, _)| before.trim_end())
+        .unwrap_or(trimmed);
+
+    if without_comment.starts_with("[[") && without_comment.ends_with("]]") {
+        let key = without_comment[2..without_comment.len() - 2].trim();
+        if key.is_empty() {
+            None
+        } else {
+            Some((TomlHeaderKind::ArrayTable, key.to_string()))
+        }
+    } else if without_comment.starts_with('[') && without_comment.ends_with(']') {
+        let key = without_comment[1..without_comment.len() - 1].trim();
+        if key.is_empty() {
+            None
+        } else {
+            Some((TomlHeaderKind::Table, key.to_string()))
+        }
+    } else {
+        None
+    }
+}
+
+fn config_header_order() -> &'static [(&'static str, TomlHeaderKind)] {
+    &[
+        ("source", TomlHeaderKind::Table),
+        ("source.allowed_outbound", TomlHeaderKind::Table),
+        ("source.exposed_ports", TomlHeaderKind::ArrayTable),
+        ("dest", TomlHeaderKind::Table),
+        ("dest.connection_filter", TomlHeaderKind::Table),
+        ("dest.exposed_services", TomlHeaderKind::ArrayTable),
+        ("auth", TomlHeaderKind::Table),
+        ("crypto", TomlHeaderKind::Table),
+        ("logging", TomlHeaderKind::Table),
+        ("metrics", TomlHeaderKind::Table),
+    ]
+}
+
+fn is_supported_config_header(key: &str) -> bool {
+    config_header_order()
+        .iter()
+        .any(|(candidate, _)| *candidate == key)
+}
+
 /// Validate configuration
 fn validate_config(config: &Config) -> Result<(), ConfigError> {
     // Validate IP ranges
@@ -453,7 +665,7 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
         }
 
         // Validate exposed_ports
-        let mut seen_ports = std::collections::HashSet::new();
+        let mut seen_ports = HashSet::new();
         for exposed in &source.exposed_ports {
             if !seen_ports.insert(exposed.port) {
                 return Err(ConfigError::ValidationError(format!(
@@ -538,5 +750,344 @@ impl DestConfig {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn toml_path(path: &Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
+    fn common_sections(ca_cert_path: &Path) -> String {
+        format!(
+            r#"
+[auth]
+use_mtls = true
+ca_cert_path = "{ca_cert_path}"
+verify_client_cert = true
+
+[crypto]
+kem_mode = "mlkem768"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+[metrics]
+enabled = false
+metrics_port = 9090
+metrics_bind_ip = "127.0.0.1"
+"#,
+            ca_cert_path = toml_path(ca_cert_path)
+        )
+    }
+
+    fn write_config_file(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, contents).unwrap();
+        (dir, config_path)
+    }
+
+    #[test]
+    fn test_load_config_rejects_duplicate_exposed_ports() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+        let source = r#"
+[source]
+mode = "protocol"
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+
+[[source.exposed_ports]]
+port = 8080
+protocol = "tcp"
+
+[[source.exposed_ports]]
+port = 8080
+protocol = "udp"
+"#;
+        let (_dir, config_path) =
+            write_config_file(&(source.to_string() + &common_sections(&ca_path)));
+
+        let err = load_config(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError(msg) if msg.contains("Duplicate port 8080")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_rejects_invalid_allowed_outbound_cidr() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+        let source = r#"
+[source]
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+
+[source.allowed_outbound]
+allowed_ips = ["not-a-cidr"]
+"#;
+        let (_dir, config_path) =
+            write_config_file(&(source.to_string() + &common_sections(&ca_path)));
+
+        let err = load_config(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError(msg) if msg.contains("Invalid IP range 'not-a-cidr'")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_rejects_invalid_service_target_ip() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+        let dest = r#"
+[dest]
+tunnel_port = 9443
+
+[[dest.exposed_services]]
+name = "web"
+port = 443
+target_ip = "not-an-ip"
+target_port = 8443
+protocol = "tcp"
+"#;
+        let (_dir, config_path) =
+            write_config_file(&(dest.to_string() + &common_sections(&ca_path)));
+
+        let err = load_config(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError(msg)
+                if msg.contains("Invalid target IP 'not-an-ip'") && msg.contains("service 'web'")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_requires_exposed_ports_in_transparent_mode() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+        let source = r#"
+[source]
+mode = "transparent"
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+"#;
+        let (_dir, config_path) =
+            write_config_file(&(source.to_string() + &common_sections(&ca_path)));
+
+        let err = load_config(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError(msg)
+                if msg.contains("Transparent/Hybrid mode requires at least one exposed_port")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_rejects_missing_ca_certificate_path() {
+        let dir = tempdir().unwrap();
+        let missing_ca = dir.path().join("missing-ca.crt");
+        let source = r#"
+[source]
+mode = "protocol"
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+
+[[source.exposed_ports]]
+port = 8080
+protocol = "tcp"
+"#;
+        let (_dir, config_path) =
+            write_config_file(&(source.to_string() + &common_sections(&missing_ca)));
+
+        let err = load_config(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError(msg) if msg.contains("CA certificate not found")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_populates_backwards_compat_cert_paths() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+        let client_cert = dir.path().join("client.crt");
+        let client_key = dir.path().join("client.key");
+        let server_cert = dir.path().join("server.crt");
+        let server_key = dir.path().join("server.key");
+
+        let contents = format!(
+            r#"
+[source]
+mode = "protocol"
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+
+[[source.exposed_ports]]
+port = 8080
+protocol = "tcp"
+
+[dest]
+tunnel_port = 9443
+
+[[dest.exposed_services]]
+name = "web"
+port = 443
+target_ip = "127.0.0.1"
+target_port = 8443
+protocol = "tcp"
+
+[auth]
+use_mtls = true
+ca_cert_path = "{ca_path}"
+client_cert_path = "{client_cert}"
+client_key_path = "{client_key}"
+server_cert_path = "{server_cert}"
+server_key_path = "{server_key}"
+verify_client_cert = true
+
+[crypto]
+kem_mode = "mlkem768"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+[logging]
+level = "info"
+format = "json"
+include_timestamp = true
+
+[metrics]
+enabled = false
+metrics_port = 9090
+metrics_bind_ip = "127.0.0.1"
+"#,
+            ca_path = toml_path(&ca_path),
+            client_cert = toml_path(&client_cert),
+            client_key = toml_path(&client_key),
+            server_cert = toml_path(&server_cert),
+            server_key = toml_path(&server_key),
+        );
+        let (_dir, config_path) = write_config_file(&contents);
+
+        let config = load_config(&config_path).unwrap();
+        let source = config.source.unwrap();
+        let dest = config.dest.unwrap();
+
+        assert_eq!(source.client_cert_path, client_cert);
+        assert_eq!(source.client_key_path, client_key);
+        assert_eq!(source.ca_cert_path, ca_path);
+        assert_eq!(dest.server_cert_path, server_cert);
+        assert_eq!(dest.server_key_path, server_key);
+        assert_eq!(dest.ca_cert_path, source.ca_cert_path);
+    }
+
+    #[test]
+    fn test_load_config_allows_missing_logging_section() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+
+        let contents = format!(
+            r#"
+[metrics]
+enabled = false
+metrics_port = 9090
+metrics_bind_ip = "127.0.0.1"
+
+[source]
+mode = "protocol"
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+
+[[source.exposed_ports]]
+port = 8080
+protocol = "tcp"
+
+[auth]
+use_mtls = true
+ca_cert_path = "{ca_path}"
+verify_client_cert = true
+
+[crypto]
+kem_mode = "mlkem768"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+"#,
+            ca_path = toml_path(&ca_path)
+        );
+        let (_dir, config_path) = write_config_file(&contents);
+
+        let config = load_config(&config_path).unwrap();
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.format, "json");
+        assert!(config.logging.include_timestamp);
+    }
+
+    #[test]
+    fn test_load_config_allows_split_and_reordered_tables() {
+        let dir = tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "ca").unwrap();
+
+        let contents = format!(
+            r#"
+[metrics]
+enabled = false
+metrics_port = 9090
+metrics_bind_ip = "127.0.0.1"
+
+[source]
+mode = "protocol"
+listen_port = 9555
+
+[auth]
+use_mtls = true
+ca_cert_path = "{ca_path}"
+verify_client_cert = true
+
+[[source.exposed_ports]]
+port = 8080
+protocol = "tcp"
+
+[crypto]
+kem_mode = "mlkem768"
+key_rotation_interval_seconds = 3600
+rehandshake_before_expiry_seconds = 300
+
+[source]
+dest_host = "dest.example.com"
+dest_tunnel_port = 8443
+
+[source.allowed_outbound]
+allowed_ips = ["10.0.0.0/8"]
+"#,
+            ca_path = toml_path(&ca_path)
+        );
+        let (_dir, config_path) = write_config_file(&contents);
+
+        let config = load_config(&config_path).unwrap();
+        let source = config.source.unwrap();
+
+        assert_eq!(source.listen_port, 9555);
+        assert_eq!(source.dest_host, "dest.example.com");
+        assert_eq!(source.dest_tunnel_port, 8443);
+        assert_eq!(source.allowed_outbound.allowed_ips, vec!["10.0.0.0/8"]);
+        assert_eq!(source.exposed_ports.len(), 1);
+        assert_eq!(config.metrics.metrics_port, 9090);
     }
 }

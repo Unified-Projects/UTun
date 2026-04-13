@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-13
+
+### Added
+- Destination-side target port readiness watcher. When a backend service is down, new connect requests now wait up to `target_connect_timeout_ms` for the target port to come back instead of failing immediately, and automatically resume once the port becomes reachable again.
+- Destination handshake admission controls with a global in-flight handshake cap (`MAX_CONCURRENT_HANDSHAKES` = 64) and per-IP rate limiting (`MAX_HANDSHAKES_PER_IP` = 16 over 10 seconds) to reduce handshake-path abuse and load spikes.
+- Expanded test coverage for config normalization and validation, certificate file access diagnostics, health monitor degradation, handshake rejection paths, source keepalive configuration, destination port recovery, and reconnection scenarios using dynamically reserved test ports.
+
+### Fixed
+- Destination tunnel listener now enforces `dest.connection_filter.allowed_source_ips` before beginning the handshake instead of accepting every source address.
+- Config loading now normalizes supported TOML section layout before deserialization, allowing known config tables to be split or ordered incorrectly without failing to parse.
+- `logging` configuration now has defaults and no longer requires an explicit `[logging]` section in the config file.
+- Client and server certificate/key access is now validated during container initialization, surfacing missing files and permission problems before the first handshake attempt.
+- Source handshake now verifies the configured destination hostname against the presented server certificate by using the hostname-aware client handshake path.
+- Metrics and health endpoints now refuse to bind to non-loopback addresses, preventing accidental remote exposure.
+- Source tunnel sockets now apply `keep_alive_interval_ms` via `SO_KEEPALIVE`.
+- Long-running integration tests now reserve ephemeral ports instead of relying on hardcoded port numbers, eliminating local port-collision flakes.
+
+### Changed
+- Source listener accept queue now uses the configured bounded `connection_channel_size` instead of an unbounded channel.
+- Destination response frames now use a bounded `mpsc::Sender<Frame>` with configured channel capacity instead of an unbounded response queue, applying backpressure before tunnel writes can grow memory usage.
+- Handshake certificate material is preloaded once at container startup on both source and destination and cloned into handshake contexts instead of being reread from disk on every handshake.
+
 ## [0.2.0] - 2026-02-16
 
 ### Added

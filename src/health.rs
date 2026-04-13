@@ -240,3 +240,51 @@ impl Clone for HealthMonitor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_monitor_task_degrades_after_stale_success() {
+        let monitor = HealthMonitor::new();
+        monitor.set_status(HealthStatus::Healthy).await;
+        *monitor.last_success.write().await = Some(Instant::now() - Duration::from_secs(31));
+
+        let task = {
+            let monitor = monitor.clone();
+            tokio::spawn(async move {
+                monitor.monitor_task(Duration::from_millis(5)).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(monitor.status().await, HealthStatus::Degraded);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_monitor_task_marks_connecting_as_unhealthy_after_timeout() {
+        let monitor = HealthMonitor {
+            status: Arc::new(RwLock::new(HealthStatus::Connecting)),
+            start_time: Instant::now() - Duration::from_secs(31),
+            last_success: Arc::new(RwLock::new(None)),
+            error_count: AtomicU64::new(0),
+            tunnel_established: AtomicBool::new(false),
+            consecutive_missed_pongs: Arc::new(RwLock::new(None)),
+            average_rtt_us: Arc::new(RwLock::new(None)),
+            reconnection_attempts: Arc::new(RwLock::new(None)),
+        };
+
+        let task = {
+            let monitor = monitor.clone();
+            tokio::spawn(async move {
+                monitor.monitor_task(Duration::from_millis(5)).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(monitor.status().await, HealthStatus::Unhealthy);
+        task.abort();
+    }
+}

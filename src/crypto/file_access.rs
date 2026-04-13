@@ -439,6 +439,7 @@ fn get_current_username() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_container_detection() {
@@ -485,5 +486,47 @@ mod tests {
         );
         assert!(suggestion.contains("insecure permissions"));
         assert!(suggestion.contains("chmod 0600"));
+    }
+
+    #[test]
+    fn test_validate_file_access_reports_missing_certificate() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("missing.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&key_path, "key").unwrap();
+
+        let err = validate_file_access(&cert_path, &key_path, "server").unwrap_err();
+        assert!(matches!(err, FileAccessError::FileNotFound { path } if path == cert_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_file_access_reports_permission_denied_for_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if get_current_uid() == 0 {
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, "cert").unwrap();
+        std::fs::write(&key_path, "key").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = validate_file_access(&cert_path, &key_path, "server").unwrap_err();
+
+        match err {
+            FileAccessError::PermissionDenied {
+                diagnostics,
+                fix_suggestion,
+            } => {
+                assert!(diagnostics.contains("Private Key"));
+                assert!(diagnostics.contains(&key_path.display().to_string()));
+                assert!(fix_suggestion.contains("chmod 0600"));
+            }
+            other => panic!("expected permission denied, got {other:?}"),
+        }
     }
 }

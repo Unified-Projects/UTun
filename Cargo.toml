@@ -57,7 +57,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # LRU cache for nonce tracking
-lru = "0.16"
+lru = "0.17"
 
 # Utilities
 rand = "0.9"

@@ -21,7 +21,7 @@ zeroize = { version = "1.7", features = ["derive"] }
 ring = "0.17"
 
 # Key derivation
-hkdf = "0.12"
+hkdf = "0.13"
 sha2 = "0.10"
 
 # TLS

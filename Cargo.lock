@@ -561,6 +561,9 @@ name = "der"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
+dependencies = [
+ "const-oid 0.10.2",
+]
 
 [[package]]
 name = "der-parser"
@@ -2378,6 +2381,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spki"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
+dependencies = [
+ "der 0.8.0",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2931,7 +2943,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
- "spki",
+ "spki 0.8.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3633,7 +3645,7 @@ dependencies = [
  "der 0.7.10",
  "sha1",
  "signature",
- "spki",
+ "spki 0.7.3",
  "tls_codec",
 ]
 

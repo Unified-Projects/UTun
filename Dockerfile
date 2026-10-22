@@ -1,7 +1,6 @@
 # Build stage
-# Use specific version tag for reproducible builds
-# To get SHA256 digest: docker pull rust:1.75.0-bookworm && docker inspect rust:1.75.0-bookworm | grep RepoDigests
-FROM rust:1.93.1-bookworm AS builder
+# Builder and runtime use the same Debian release so the binary links against a matching glibc
+FROM rust:1.99.1-trixie AS builder
 
 WORKDIR /app
 
@@ -33,13 +32,12 @@ ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP:-unknown}
 RUN cargo build --release
 
 # Runtime stage
-# Use specific version tag for reproducible builds
-# To get SHA256 digest: docker pull debian:bookworm-20240130-slim && docker inspect debian:bookworm-20240130-slim | grep RepoDigests
-FROM debian:bookworm-20260112-slim
+FROM debian:trixie-20261020-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
+# Apply pending security updates to the base image, then install runtime dependencies
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
     && rm -rf /var/lib/apt/lists/*

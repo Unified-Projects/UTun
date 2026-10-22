@@ -208,11 +208,11 @@ impl HealthMonitor {
                         self.set_status(HealthStatus::Unhealthy).await;
                     }
                 }
-                None if current_status == HealthStatus::Connecting => {
-                    // Still trying to connect - check if timeout exceeded
-                    if self.start_time.elapsed() > Duration::from_secs(30) {
-                        self.set_status(HealthStatus::Unhealthy).await;
-                    }
+                None if current_status == HealthStatus::Connecting
+                    && self.start_time.elapsed() > Duration::from_secs(30) =>
+                {
+                    // Still connecting after the startup timeout
+                    self.set_status(HealthStatus::Unhealthy).await;
                 }
                 _ => {}
             }

@@ -211,3 +211,79 @@ mod symmetric_tests {
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 }
+
+/// Known-answer tests pinning the outputs of the key derivation primitives used on the wire.
+/// Any change to these values breaks interoperability with deployed peers.
+mod kdf_known_answer_tests {
+    use hkdf::Hkdf;
+    use sha2::{Digest, Sha256, Sha384};
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_sha256_known_answer() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"abc");
+        assert_eq!(
+            hasher.finalize().to_vec(),
+            hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    /// RFC 5869 test case 3: HKDF-SHA256 with no salt and empty info.
+    #[test]
+    fn test_hkdf_sha256_rfc5869_case3() {
+        let hkdf = Hkdf::<Sha256>::new(None, &[0x0b; 22]);
+        let mut okm = [0u8; 42];
+        hkdf.expand(&[], &mut okm).unwrap();
+        assert_eq!(
+            okm.to_vec(),
+            hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+        );
+    }
+
+    /// Mirrors the session key split performed by the source and destination tunnels.
+    #[test]
+    fn test_hkdf_sha256_session_key_split() {
+        let session_key: Vec<u8> = (0u8..32).collect();
+        let hkdf = Hkdf::<Sha256>::new(None, &session_key);
+
+        let mut enc_key = [0u8; 32];
+        let mut mac_key = [0u8; 32];
+        hkdf.expand(b"encryption", &mut enc_key).unwrap();
+        hkdf.expand(b"authentication", &mut mac_key).unwrap();
+
+        assert_eq!(
+            enc_key.to_vec(),
+            hex("c4d9879f1d607713798b3a15a36cb130ff3291ee8092b96698d472087fa8af4c")
+        );
+        assert_eq!(
+            mac_key.to_vec(),
+            hex("14bc679bee7fe1886cb4e6c8df18677bf577476989dfd84934f9c628b700da9f")
+        );
+    }
+
+    /// Mirrors the hybrid KEM derivation: HKDF-SHA384 salted with the ciphertext.
+    #[test]
+    fn test_hkdf_sha384_hybrid_kem_derivation() {
+        let ikm: Vec<u8> = (0u8..64).collect();
+        let salt: Vec<u8> = (0u8..128).map(|i| i.wrapping_mul(7)).collect();
+        let mut info = Vec::new();
+        info.extend_from_slice(b"UTun-Hybrid-KEM-v1-derive");
+        info.extend_from_slice(&salt[..32]);
+
+        let hkdf = Hkdf::<Sha384>::new(Some(&salt), &ikm);
+        let mut okm = [0u8; 64];
+        hkdf.expand(&info, &mut okm).unwrap();
+
+        assert_eq!(
+            okm.to_vec(),
+            hex("015555838f228dd31096377498466de390b9102e594ec541e875787b6590ee6036dead9aa1c6a929013f424229527ac0c33ae151104c1510583a6c793300b95f")
+        );
+    }
+}

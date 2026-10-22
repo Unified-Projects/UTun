@@ -329,7 +329,7 @@ impl ConnectionManager {
 
     pub async fn close_all(&self) {
         let mut connections = self.connections.write().await;
-        for (_, conn) in connections.iter() {
+        for conn in connections.values() {
             conn.set_state(ConnectionState::Closed);
         }
         connections.clear();

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-23
+
+### Security
+- Container image now builds on `rust:1.99.1-trixie` and runs on `debian:trixie-20261020-slim`, with `apt-get upgrade` applied at build time. This picks up Debian fixes for GnuTLS, OpenSSL, perl-base, libcap2 and PCRE2 reported against the 0.2.1 image.
+- `libssl3` is no longer installed in the runtime image. The binary uses rustls and never linked against OpenSSL.
+
+### Changed
+- Updated dependencies: sha2 0.11, hkdf 0.13, lru 0.19, spki 0.8, clap 4.6, socket2 0.6.3, libc 0.2.183, plus a refresh of the lockfile to the latest compatible releases.
+- Added known-answer tests for the SHA-256, HKDF-SHA256 and HKDF-SHA384 derivations used in the handshake and session key setup. Derived keys are unchanged, so 0.2.2 interoperates with 0.2.1 peers.
+
 ## [0.2.1] - 2026-04-13
 
 ### Added

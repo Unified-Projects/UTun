@@ -1,6 +1,6 @@
 [package]
 name = "utun"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["UTun Contributors"]
 description = "Quantum-safe tunnel system"
@@ -21,8 +21,8 @@ zeroize = { version = "1.7", features = ["derive"] }
 ring = "0.17"
 
 # Key derivation
-hkdf = "0.12"
-sha2 = "0.10"
+hkdf = "0.13"
+sha2 = "0.11"
 
 # TLS
 rustls = { version = "0.23", features = ["ring"] }
@@ -35,7 +35,7 @@ x509-cert = { version = "0.2", features = ["pem", "builder"] }
 pem-rfc7468 = { version = "1.0", features = ["std"] }
 const-oid = "0.10"
 der = "0.8"
-spki = "0.7"
+spki = "0.8"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -46,7 +46,7 @@ bytes = "1.5"
 futures = "0.3"
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 
 # Logging
 tracing = "0.1"
@@ -57,13 +57,13 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # LRU cache for nonce tracking
-lru = "0.16"
+lru = "0.19"
 
 # Utilities
 rand = "0.9"
 chrono = "0.4"
 ipnetwork = "0.21"
-socket2 = "0.6.2"
+socket2 = "0.6.3"
 
 # Metrics
 prometheus = "0.14"
@@ -77,7 +77,7 @@ tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "m
 
 # HTTP client for health checks
 reqwest = { version = "0.13.1", features = ["json"] }
-libc = "0.2.182"
+libc = "0.2.183"
 
 # Windows ACL checking
 [target.'cfg(windows)'.dependencies]

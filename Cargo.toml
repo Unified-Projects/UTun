@@ -13,7 +13,7 @@ pqcrypto-classicmceliece = "0.2"
 pqcrypto-traits = "0.3"
 
 # Symmetric cryptography
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 aead = "0.5"
 
 # Security

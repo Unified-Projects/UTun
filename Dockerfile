@@ -32,7 +32,7 @@ ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP:-unknown}
 RUN cargo build --release
 
 # Runtime stage
-FROM debian:trixie-20261020-slim
+FROM debian:trixie-20261027-slim
 
 # Apply pending security updates to the base image, then install runtime dependencies
 RUN apt-get update \
